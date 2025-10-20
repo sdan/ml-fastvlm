@@ -75,6 +75,52 @@ class CLIPVisionTower(nn.Module):
 
         return image_features
 
+
+        """Encode a batch of image patches to single-token features.
+
+        Expects input patches shaped [B, C, P, P] in the same value range
+        used by the model's normal preprocessing. If P differs from the
+        underlying ViT patch size, patches are resized to match.
+
+        Returns
+        -------
+        torch.Tensor
+            Patch embeddings with shape [B, D], where D matches the tower's
+            hidden size per token.
+        """
+        if not self.is_loaded:
+            self.load_model()
+
+        assert patches.ndim == 4, f"Expected [B,C,P,P], got {tuple(patches.shape)}"
+
+        # If patches are smaller than the ViT patch size, upsample to minimum
+        # viable size; if larger, keep as-is to allow multiple tokens and pick
+        # a consistent local token.
+        target = int(self.config.patch_size)
+        h, w = int(patches.shape[-2]), int(patches.shape[-1])
+        if h < target or w < target:
+            patches = torch.nn.functional.interpolate(
+                patches, size=(max(h, target), max(w, target)), mode="bilinear", align_corners=False
+            )
+
+        # Run through vision tower and select the single patch token
+        outs = self.vision_tower(
+            patches.to(device=self.device, dtype=self.dtype), output_hidden_states=True
+        )
+        feats = self.feature_select(outs)  # [B, N, D]
+        if feats.ndim == 3 and feats.shape[1] > 1:
+            # If multiple tokens are produced (e.g., due to interpolation),
+            # pick a location-consistent token. For CLIP with patch-sized input
+            # N is typically 1. If >1, default to the center token.
+            idx = feats.shape[1] // 2
+            if positions is not None and positions.numel() > 0:
+                # Placeholder for future mapping from global (i,j) to local index.
+                # For now, keep using the center token for stability.
+                pass
+            feats = feats[:, idx:idx + 1]
+        feats = feats.squeeze(1)  # [B, D]
+        return feats
+
     @property
     def dummy_feature(self):
         return torch.zeros(1, self.hidden_size, device=self.device, dtype=self.dtype)

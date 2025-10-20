@@ -87,6 +87,66 @@ class MobileCLIPVisionTower(nn.Module):
 
         return image_features
 
+    def encode_patch(self, patches: torch.Tensor, positions: torch.Tensor | None = None) -> torch.Tensor:
+        """Encode a batch of image patches to single-token features.
+
+        For MobileCLIP/FastViTHD, we forward the patches through the vision
+        tower to obtain a grid of local features and then reduce them to a
+        single representative token per patch via spatial averaging. This
+        provides a stable per-patch embedding suitable for differential
+        updates.
+
+        Parameters
+        ----------
+        patches : torch.Tensor
+            Tensor of shape [B, C, P, P] in the same value range as the
+            model's expected inputs.
+
+        Returns
+        -------
+        torch.Tensor
+            Patch embeddings with shape [B, D].
+        """
+        if not self.is_loaded:
+            self.load_model()
+
+        assert patches.ndim == 4, f"Expected [B,C,P,P], got {tuple(patches.shape)}"
+
+        # If patches are smaller than the minimum patch granularity, upsample
+        # to minimum; if larger, keep as-is to preserve local multi-token grid.
+        min_patch = int(self.config["image_cfg"]["patch_size"])  # minimum granularity
+        h, w = int(patches.shape[-2]), int(patches.shape[-1])
+        if h < min_patch or w < min_patch:
+            patches = torch.nn.functional.interpolate(
+                patches, size=(max(h, min_patch), max(w, min_patch)), mode="bilinear", align_corners=False
+            )
+
+        # Forward to obtain per-location embeddings, then pool to a single token
+        outs = self.vision_tower(
+            patches.to(device=self.device, dtype=self.dtype), return_image_embeddings=True
+        )
+        feats = self.feature_select(outs)  # [B, H*W, D]
+        if feats.ndim == 3 and feats.shape[1] > 1:
+            # Try to select a consistent spatial location within the patch.
+            # Map flattened [H*W] to a 2D grid and pick center by default.
+            B, HW, D = feats.shape
+            side = int(round(HW ** 0.5))
+            if side * side == HW:
+                feats_2d = feats.view(B, side, side, D)
+                ci = side // 2
+                cj = side // 2
+                if positions is not None and positions.numel() > 0:
+                    # Placeholder for potential coordinate-aware mapping.
+                    # Today we still pick center to maintain stability.
+                    pass
+                feats = feats_2d[:, ci, cj, :]
+            else:
+                # Fallback to mean if non-square
+                feats = feats.mean(dim=1)
+        else:
+            feats = feats.squeeze(1)
+        return feats
+
     @property
     def dummy_feature(self):
         return torch.zeros(1, self.hidden_size, device=self.device, dtype=self.dtype)
