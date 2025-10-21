@@ -96,7 +96,7 @@ def _extract_image_token_counts(model, image_tensor: torch.Tensor, image_size):
                      - List/Tuple of tensors -> returns [feat.shape[0] for feat in features]
     """
     with torch.inference_mode():
-        features = model.encode_images(image_tensor, image_sizes=[image_size])
+        features = model.encode_images(image_tensor)
 
     # Normalize different return types to obtain token counts
     if isinstance(features, tuple):
@@ -383,7 +383,10 @@ def predict(args):
     original_encode = getattr(model, "encode_images", None)
     torch_device = torch.device(device)
 
-    if not args.disable_differential:
+    # Differential vision is DISABLED by default. Enable only if explicitly requested.
+    use_differential = bool(getattr(args, "enable_differential", False)) and not bool(getattr(args, "disable_differential", False))
+
+    if use_differential:
         if original_encode is None:
             raise RuntimeError("Loaded model does not expose encode_images required for differential mode.")
 
@@ -410,7 +413,46 @@ def predict(args):
 
         model.encode_images = encode_images_with_cache
 
-    qs = args.prompt
+    # Build user text according to prompt style
+    user_text = args.prompt
+    if getattr(args, "prompt_style", "plain") == "pyautogui":
+        instr = (
+            "Look at the image and predict the exact screen coordinates for this action.\n"
+            "Output ONLY valid pyautogui commands. Use normalized coordinates (0.0 to 1.0) based on what you see.\n"
+            "Command formats:\n"
+            "pyautogui.click(x=<screen_x>, y=<screen_y>)\n"
+            "pyautogui.rightClick(x=<screen_x>, y=<screen_y>)\n"
+            "pyautogui.doubleClick(x=<screen_x>, y=<screen_y>)\n"
+            "pyautogui.moveTo(x=<screen_x>, y=<screen_y>)\n"
+            "pyautogui.dragTo(x=<screen_x>, y=<screen_y>)\n"
+            "pyautogui.write(message='<text>')\n"
+            "pyautogui.press('<key_name>')\n"
+            "pyautogui.hotkey('<key1>', '<key2>')\n"
+            "pyautogui.scroll(<amount>)\n"
+            "pyautogui.hscroll(<amount>)\n\n"
+            "Action:"
+        )
+        user_text = f"{instr}\n{args.prompt}"
+    elif getattr(args, "prompt_style", "plain") == "attention_click":
+        instr = (
+            "Look at the image and predict the exact screen coordinates for this action.\n"
+            "Output ONLY valid pyautogui commands. Use normalized coordinates (0.0 to 1.0) based on what you see.\n"
+            "Command formats:\n"
+            "pyautogui.click x=<screen_x>, y=<screen_y>\n"
+            "pyautogui.rightClick x=<screen_x>, y=<screen_y>\n"
+            "pyautogui.doubleClick x=<screen_x>, y=<screen_y>\n"
+            "pyautogui.moveTo x=<screen_x>, y=<screen_y>\n"
+            "pyautogui.dragTo x=<screen_x>, y=<screen_y>\n"
+            "pyautogui.scroll <amount>\n"
+            "pyautogui.hscroll <amount>\n"
+            "pyautogui.write(message='<text>')\n"
+            "pyautogui.press('<key_name>')\n"
+            "pyautogui.hotkey('<key1>', '<key2>')\n\n"
+            "Action:"
+        )
+        user_text = f"{instr}\n{args.prompt}"
+
+    qs = user_text
     if model.config.mm_use_im_start_end:
         qs = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN + "\n" + qs
     else:
@@ -455,6 +497,7 @@ def predict(args):
             num_beams=args.num_beams,
             context_steps=int(getattr(args, 'guibench_context_steps', 0) or 0),
             custom_prompt=getattr(args, 'guibench_prompt', None),
+            attention_click_prompt=bool(getattr(args, 'attention_click', False)),
         )
 
         print("\n" + "=" * 60)
@@ -625,12 +668,29 @@ if __name__ == "__main__":
         default=None,
         help="Process at most this many sequences when using --sequence-root.",
     )
-    parser.add_argument("--prompt", type=str, default="Describe the image.", help="Prompt for VLM.")
+    parser.add_argument("--prompt", type=str, default="Describe the image.", help="Prompt or action text.")
+    parser.add_argument(
+        "--prompt-style",
+        type=str,
+        choices=["plain", "pyautogui", "attention_click"],
+        default="plain",
+        help="How to construct the prompt from the action text.",
+    )
     parser.add_argument("--conv-mode", type=str, default="qwen_2")
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--top_p", type=float, default=None)
     parser.add_argument("--num_beams", type=int, default=1)
-    parser.add_argument("--disable-differential", action="store_true", help="Disable differential vision encoding.")
+    # Differential vision flags
+    parser.add_argument(
+        "--enable-differential",
+        action="store_true",
+        help="Enable differential vision encoding (disabled by default).",
+    )
+    parser.add_argument(
+        "--disable-differential",
+        action="store_true",
+        help="Deprecated: differential is disabled by default; use --enable-differential to turn it on.",
+    )
     parser.add_argument("--diff-threshold", type=float, default=0.05, help="Patch change threshold (0-1).")
     parser.add_argument(
         "--diff-max-changed-patches",

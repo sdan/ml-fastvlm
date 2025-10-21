@@ -192,9 +192,15 @@ class AttentionExtractor:
                     test_attn = layer_attn[:, test_pos, :].mean(dim=0)
                     print(f"DEBUG: pos {test_pos}: min={test_attn.min():.6f}, max={test_attn.max():.6f}, has_nan={torch.isnan(test_attn).any()}")
 
-            # Select query position based on strategy
+            # Determine number of vision tokens and build a mask over expanded sequence
+            num_vision_tokens = self.get_vision_token_count(
+                image_size, prompt_ids, valid_len
+            )
+            mask = self._build_vision_mask(prompt_ids[0], num_vision_tokens, valid_len)
+
+            # Select query position based on strategy (prefer last non-image tokens)
             query_pos = self._select_query_position(
-                prompt_ids, valid_len, query_strategy, attention_mask
+                prompt_ids, valid_len, query_strategy, attention_mask, mask
             )
 
             # WORKAROUND: If last position has NaN, use second-to-last
@@ -203,8 +209,15 @@ class AttentionExtractor:
                 print(f"DEBUG: Last position has NaN attention, using second-to-last position")
                 query_pos = valid_len - 2
 
-            # Get attention from query to all positions
-            attn_weights = layer_attn[:, query_pos, :].mean(dim=0)  # Average over heads
+            # Get attention from selected query position(s) to all positions
+            if isinstance(query_pos, (list, tuple)) and len(query_pos) > 1:
+                # Average attention over multiple query positions, then over heads
+                q_idx = torch.tensor(query_pos, device=layer_attn.device, dtype=torch.long)
+                attn_sel = layer_attn[:, q_idx, :]            # [H, K, L]
+                attn_weights = attn_sel.mean(dim=1).mean(dim=0)  # [L]
+            else:
+                q = query_pos[0] if isinstance(query_pos, (list, tuple)) else query_pos
+                attn_weights = layer_attn[:, q, :].mean(dim=0)  # Average over heads
 
             # Debug: Check attention stats
             print(f"DEBUG: query_pos={query_pos}, valid_len={valid_len}")
@@ -212,11 +225,7 @@ class AttentionExtractor:
             print(f"DEBUG: attn_weights min={attn_weights.min():.6f}, max={attn_weights.max():.6f}, mean={attn_weights.mean():.6f}")
             print(f"DEBUG: Has NaN: {torch.isnan(attn_weights).any()}, Has Inf: {torch.isinf(attn_weights).any()}")
 
-            # Build image token mask efficiently
-            num_vision_tokens = self.get_vision_token_count(
-                image_size, prompt_ids, valid_len
-            )
-            mask = self._build_vision_mask(prompt_ids[0], num_vision_tokens, valid_len)
+            # We already built the mask above
 
             if mask is None:
                 return None
@@ -276,32 +285,48 @@ class AttentionExtractor:
                               prompt_ids: torch.Tensor,
                               valid_len: int,
                               strategy: str,
-                              attention_mask: Optional[torch.Tensor]) -> int:
-        """Select query token position based on strategy."""
+                              attention_mask: Optional[torch.Tensor],
+                              vision_mask: Optional[torch.Tensor] = None):
+        """Select query token position(s) based on strategy.
+
+        Returns either an int (single position) or a list of ints (to be averaged).
+        Prefers non-image (text) positions when possible to reduce corner bias.
+        """
+        # Default: last token
         if strategy == 'last':
             return valid_len - 1
-        
-        elif strategy == 'last_text':
-            # Find last non-image token position
-            # This requires tracking which positions are image tokens
-            # For simplicity, use last position minus estimated image tokens at end
-            return valid_len - 1  # TODO: Implement proper last text token finding
-        
-        elif strategy == 'cls':
+
+        # First token (CLS-like)
+        if strategy == 'cls':
             return 0
-        
-        elif strategy.startswith('mean_last_'):
-            # Extract k from strategy (e.g., 'mean_last_5')
+
+        # Build a non-image mask over expanded sequence if available
+        non_image_idx = None
+        if vision_mask is not None and isinstance(vision_mask, torch.Tensor) and vision_mask.shape[0] == valid_len:
+            non_image_mask = ~vision_mask
+            if non_image_mask.any():
+                non_image_idx = torch.nonzero(non_image_mask, as_tuple=False).squeeze(1)
+
+        if strategy == 'last_text':
+            if non_image_idx is not None and non_image_idx.numel() > 0:
+                return int(non_image_idx[-1].item())
+            return valid_len - 1
+
+        if strategy.startswith('mean_last_'):
+            # Average the attention from the last-k non-image (text) tokens
             try:
                 k = int(strategy.split('_')[-1])
-                # For now, just use last position
-                # TODO: Implement averaging over last k positions
-                return valid_len - 1
-            except:
-                return valid_len - 1
-        
-        else:
-            return valid_len - 1
+            except Exception:
+                k = 4
+            if non_image_idx is not None and non_image_idx.numel() > 0:
+                k = max(1, min(k, non_image_idx.numel()))
+                return [int(x.item()) for x in non_image_idx[-k:]]
+            # Fallback: average last-k overall positions
+            k = max(1, min(k, valid_len))
+            return list(range(valid_len - k, valid_len))
+
+        # Fallback
+        return valid_len - 1
     
     def _build_vision_mask(self, 
                           prompt_tokens: torch.Tensor,

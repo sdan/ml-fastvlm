@@ -238,9 +238,28 @@ class ClickTargeter:
             return largest.center
         
         elif strategy == 'center_weighted':
-            # Weight by attention * inverse distance from image center
-            # TODO: Implement center weighting
-            return candidates[0].center
+            # Prefer high attention near the image center to reduce corner bias.
+            # Estimate the image size from candidate boxes (robust when image size is unknown).
+            max_x = max(c.bbox[2] for c in candidates)
+            max_y = max(c.bbox[3] for c in candidates)
+            cx_img = max_x / 2.0
+            cy_img = max_y / 2.0
+            # Diagonal for normalization
+            diag = (cx_img**2 + cy_img**2) ** 0.5 + 1e-6
+            best = None
+            best_score = -1.0
+            for c in candidates:
+                dx = c.center[0] - cx_img
+                dy = c.center[1] - cy_img
+                dist = (dx*dx + dy*dy) ** 0.5
+                # Gaussian falloff toward edges; lambda controls penalty strength
+                lam = 3.5
+                weight = float(np.exp(-lam * (dist / diag) ** 2))
+                score = c.attention_score * weight
+                if score > best_score:
+                    best_score = score
+                    best = c
+            return best.center if best is not None else candidates[0].center
         
         else:
             return candidates[0].center

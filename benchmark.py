@@ -12,6 +12,7 @@ import json
 import re
 import time
 from dataclasses import dataclass
+import math
 from typing import Optional, List, Dict, Tuple
 
 
@@ -306,6 +307,11 @@ def add_guibench_args(parser) -> None:
         default=None,
         help="Custom prompt template with {action} placeholder for model-specific prompting",
     )
+    group.add_argument(
+        "--attention-click",
+        action="store_true",
+        help="Use attention-click prompt style (no parentheses except for write/press/hotkey)",
+    )
 
 
 def _extract_pyautogui_lines(text: str) -> List[str]:
@@ -320,6 +326,13 @@ def _extract_pyautogui_lines(text: str) -> List[str]:
         r"^pyautogui\.(%s)\s*\(.*\)\s*$" % ("|".join(map(re.escape, ALLOWED_PYAUTOGUI_FUNCS))),
         re.IGNORECASE,
     )
+    # In attention-click style, pointer actions may be emitted without parentheses.
+    # Accept bare forms for a safe subset of functions.
+    _bare_ok = {"click", "moveTo", "dragTo", "doubleClick", "rightClick"}
+    pat_bare = re.compile(
+        r"^pyautogui\.(%s)\s*$" % ("|".join(map(re.escape, _bare_ok))),
+        re.IGNORECASE,
+    )
     cmd_lines: List[str] = []
     for ln in lines:
         m = pat.match(ln)
@@ -329,6 +342,11 @@ def _extract_pyautogui_lines(text: str) -> List[str]:
             # Keep original content but ensure prefix is normalized to "pyautogui.<Func>"
             rest = ln.split(".", 1)[1] if "." in ln else ln
             cmd_lines.append(f"pyautogui.{rest}")
+        else:
+            m2 = pat_bare.match(ln)
+            if m2:
+                func = m2.group(1)
+                cmd_lines.append(f"pyautogui.{func}")
     return cmd_lines
 
 
@@ -464,7 +482,7 @@ class GuiBench:
         # The NL instruction for what to do
         return str(step.get("action", ""))
 
-    def run(self, *, tokenizer, model, image_processor, device, conv_mode: str = "qwen_2", temperature: float = 0.2, top_p: Optional[float] = None, num_beams: int = 1, custom_prompt: Optional[str] = None, context_steps: int = 0) -> GuiBenchResult:
+    def run(self, *, tokenizer, model, image_processor, device, conv_mode: str = "qwen_2", temperature: float = 0.2, top_p: Optional[float] = None, num_beams: int = 1, custom_prompt: Optional[str] = None, context_steps: int = 0, attention_click_prompt: bool = False) -> GuiBenchResult:
         # Local imports to avoid heavy deps at module import time
         import torch
         from PIL import Image
@@ -506,22 +524,42 @@ class GuiBench:
                 # Allow custom prompt template with {action} placeholder
                 user_plain = custom_prompt.format(action=action_text)
             else:
-                instr = (
-                    "Look at the image and predict the exact screen coordinates for this action.\n"
-                    "Output ONLY valid pyautogui commands. Use normalized coordinates (0.0 to 1.0) based on what you see.\n"
-                    "Command formats:\n"
-                    "pyautogui.click(x=<screen_x>, y=<screen_y>)\n"
-                    "pyautogui.rightClick(x=<screen_x>, y=<screen_y>)\n"
-                    "pyautogui.doubleClick(x=<screen_x>, y=<screen_y>)\n"
-                    "pyautogui.moveTo(x=<screen_x>, y=<screen_y>)\n"
-                    "pyautogui.dragTo(x=<screen_x>, y=<screen_y>)\n"
-                    "pyautogui.write(message='<text>')\n"
-                    "pyautogui.press('<key_name>')\n"
-                    "pyautogui.hotkey('<key1>', '<key2>')\n"
-                    "pyautogui.scroll(<amount>)\n"
-                    "pyautogui.hscroll(<amount>)\n\n"
-                    "Action:"
-                )
+                if attention_click_prompt:
+                    # Attention-click style: no parentheses for pointer actions; keep for write/press/hotkey
+                    instr = (
+                        "Look at the image and predict the exact screen coordinates for this action.\n"
+                        "Output ONLY pyautogui command name\n"
+                        "Command formats:\n"
+                        "pyautogui.click\n"
+                        "pyautogui.rightClick\n"
+                        "pyautogui.doubleClick\n"
+                        "pyautogui.moveTo\n"
+                        "pyautogui.dragTo\n"
+                        "pyautogui.scroll <amount>\n"
+                        "pyautogui.hscroll <amount>\n"
+                        "pyautogui.write(message='<text>')\n"
+                        "pyautogui.press('<key_name>')\n"
+                        "pyautogui.hotkey('<key1>', '<key2>')\n\n"
+                        "Action:"
+                    )
+                else:
+                    # Default style: include parentheses for all examples
+                    instr = (
+                        "Look at the image and predict the exact screen coordinates for this action.\n"
+                        "Output ONLY valid pyautogui commands. Use normalized coordinates (0.0 to 1.0) based on what you see.\n"
+                        "Command formats:\n"
+                        "pyautogui.click(x=<screen_x>, y=<screen_y>)\n"
+                        "pyautogui.rightClick(x=<screen_x>, y=<screen_y>)\n"
+                        "pyautogui.doubleClick(x=<screen_x>, y=<screen_y>)\n"
+                        "pyautogui.moveTo(x=<screen_x>, y=<screen_y>)\n"
+                        "pyautogui.dragTo(x=<screen_x>, y=<screen_y>)\n"
+                        "pyautogui.write(message='<text>')\n"
+                        "pyautogui.press('<key_name>')\n"
+                        "pyautogui.hotkey('<key1>', '<key2>')\n"
+                        "pyautogui.scroll(<amount>)\n"
+                        "pyautogui.hscroll(<amount>)\n\n"
+                        "Action:"
+                    )
                 user_plain = f"{instr}\n{action_text}"
             # Rebuild conversation fresh each step so only current turn carries the <image> token
             conv = conv_templates[conv_mode].copy()
@@ -564,6 +602,141 @@ class GuiBench:
                     use_cache=True,
                 )
 
+            # Decode the first-pass text early so we can use it for heatmap query aggregation
+            pred_text = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
+            
+            # Also extract expected commands early to enable GT marker on the heatmap
+            exp_cmds = self._extract_expected_commands(step)
+
+            # Save attention heatmap overlay whenever attention-click prompt style is used
+            # Keep a handle to the last computed heatmap for optional second-pass picking
+            last_heatmap = None
+            if attention_click_prompt:
+                # Default output location and params
+                default_target = "heatmaps"
+                default_layer = -1
+                default_alpha = 0.45
+                default_mode = "smooth"
+
+                expects_multi = len(steps) > 1
+                heatmap_path = _resolve_heatmap_path(default_target, img_path, expects_multi)
+                if heatmap_path:
+                    try:
+                        # Extract ground truth coordinates from expected commands
+                        gt_coords = None
+                        for exp_cmd in exp_cmds:
+                            coords = _parse_coordinates_from_command(exp_cmd)
+                            if coords is not None:
+                                gt_coords = coords
+                                break  # Use first coordinate-based command
+
+                        # Rebuild a conversation INCLUDING the generated assistant text,
+                        # so the last token belongs to pred_text (not the instruction).
+                        attn_conv = conv_templates[conv_mode].copy()
+                        if context_steps > 0:
+                            for u, a in history[-int(context_steps):]:
+                                attn_conv.append_message(attn_conv.roles[0], u)
+                                attn_conv.append_message(attn_conv.roles[1], a)
+                        attn_user = (
+                            DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN + "\n" + user_plain
+                            if getattr(model.config, "mm_use_im_start_end", False)
+                            else DEFAULT_IMAGE_TOKEN + "\n" + user_plain
+                        )
+                        attn_conv.append_message(attn_conv.roles[0], attn_user)
+                        # IMPORTANT: include model's generated text as assistant message
+                        attn_conv.append_message(attn_conv.roles[1], pred_text or "")
+                        attn_prompt = attn_conv.get_prompt()
+                        attn_ids = tokenizer_image_token(
+                            attn_prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt"
+                        ).unsqueeze(0).to(device)
+
+                        # Aggregate attention over all generated tokens in this step
+                        gen_token_count = max(1, int(attn_ids.shape[1] - input_ids.shape[1]))
+                        heatmap = _extract_attention_heatmap(
+                            model,
+                            attn_ids,
+                            image_tensor,
+                            pil_img.size,
+                            layer_index=int(default_layer),
+                            query_last_n=gen_token_count,
+                        )
+                        last_heatmap = heatmap
+                        if self.verbose and heatmap is not None:
+                            try:
+                                hmin = float(heatmap.min().item())
+                                hmax = float(heatmap.max().item())
+                                hmean = float(heatmap.mean().item())
+                                print(f"[heatmap] stats: shape={list(heatmap.shape)}, min={hmin:.4f}, max={hmax:.4f}, mean={hmean:.4f}")
+                            except Exception:
+                                pass
+                        # Build heatmap overlay, drawing candidate boxes as well
+                        overlay = None
+                        if heatmap is not None:
+                            try:
+                                # Lazily import targeter only when needed
+                                from attention_click.click_targeter import ClickTargeter
+                                from PIL import ImageDraw
+                                # Generate top-K candidates for visualization
+                                K = 4
+                                targeter = ClickTargeter(max_candidates=K)
+                                candidates = targeter.generate_candidates(
+                                    heatmap,
+                                    pil_img.size,
+                                    adaptive_threshold=True,
+                                    interpolation_mode=("bilinear" if str(default_mode) != "tile" else "nearest"),
+                                )
+                                # Create overlay with heatmap and boxes
+                                overlay = targeter.visualize_candidates(
+                                    pil_img,
+                                    candidates=candidates,
+                                    heatmap=heatmap,
+                                    alpha=float(default_alpha),
+                                    interpolation_mode=("bilinear" if str(default_mode) != "tile" else "nearest"),
+                                )
+                                # Draw ground-truth marker on top if available
+                                if gt_coords is not None:
+                                    x, y = gt_coords
+                                    if 0 <= x <= 1 and 0 <= y <= 1:
+                                        px = int(x * pil_img.width)
+                                        py = int(y * pil_img.height)
+                                    else:
+                                        px = int(x)
+                                        py = int(y)
+                                    draw = ImageDraw.Draw(overlay)
+                                    radius = 12
+                                    # Outer white ring
+                                    draw.ellipse(
+                                        [(px - radius - 2, py - radius - 2), (px + radius + 2, py + radius + 2)],
+                                        outline="white",
+                                        width=3,
+                                    )
+                                    # Inner cyan disc
+                                    draw.ellipse(
+                                        [(px - radius, py - radius), (px + radius, py + radius)],
+                                        fill="cyan",
+                                        outline="black",
+                                        width=2,
+                                    )
+                            except Exception:
+                                # Fallback to plain heatmap overlay if candidate drawing fails
+                                overlay = _render_heatmap_overlay(
+                                    pil_img,
+                                    heatmap,
+                                    alpha=float(default_alpha),
+                                    mode=str(default_mode),
+                                    ground_truth_coords=gt_coords,
+                                )
+                        if overlay is not None:
+                            overlay.save(heatmap_path)
+                            if self.verbose:
+                                print(f"[heatmap] saved overlay: {heatmap_path}")
+                        else:
+                            print(f"[heatmap] Skipping {os.path.basename(img_path)} (no vision tokens or attention available).")
+                    except Exception as exc:
+                        print(f"[heatmap] Failed to generate heatmap for {img_path}: {exc}")
+
+
+
             if self.verbose:
                 print(f"[DEBUG] output_ids shape: {output_ids.shape}")
                 print(f"[DEBUG] input_ids shape: {input_ids.shape}")
@@ -571,12 +744,10 @@ class GuiBench:
                 gen_count = output_ids.shape[1] - input_ids.shape[1] if output_ids.shape[1] >= input_ids.shape[1] else output_ids.shape[1]
                 print(f"[DEBUG] Generated tokens: {gen_count}")
 
-            pred_text = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
             # Save turn into plain-text history for the next step
             history.append((user_plain, pred_text))
 
             pred_cmds = _extract_pyautogui_lines(pred_text)
-            exp_cmds = self._extract_expected_commands(step)
 
             if self.verbose:
                 print(f"\n[Step {idx}] {os.path.basename(img_path)}")
@@ -595,7 +766,119 @@ class GuiBench:
                 for ln in pred_cmds:
                     print("  ", ln)
 
-            # Score: count of expected commands matched by prediction
+            # Optional second forward pass: inject top-K candidate boxes and ask model to pick one
+            # This runs only in attention-click mode and only if a heatmap was computed
+            final_pick_cmds: List[str] = []
+            if attention_click_prompt and last_heatmap is not None:
+                try:
+                    # Lazily import click targeter to keep dependencies local
+                    from attention_click.click_targeter import ClickTargeter
+
+                    K = 4
+                    targeter = ClickTargeter(max_candidates=K)
+                    candidates = targeter.generate_candidates(
+                        last_heatmap, pil_img.size, adaptive_threshold=True
+                    )
+
+                    if candidates:
+                        # Limit to top-K
+                        candidates = candidates[:K]
+                        if self.verbose:
+                            print(f"[second-pass] candidates: requested={K}, generated={len(candidates)}")
+                            for i, c in enumerate(candidates, 1):
+                                x1, y1, x2, y2 = c.bbox
+                                cx, cy = c.center
+                                print(f"  {i}. bbox=({x1},{y1},{x2},{y2}) center=({cx},{cy}) score={c.attention_score:.3f} area={c.area}")
+
+                        # Build compact numbered list for the prompt
+                        def _format_boxes_for_prompt(cands) -> str:
+                            lines = []
+                            for i, c in enumerate(cands, 1):
+                                x1, y1, x2, y2 = c.bbox
+                                cx, cy = c.center
+                                lines.append(
+                                    f"Box {i}: ({x1},{y1})-({x2},{y2}), center=({cx},{cy})"
+                                )
+                            return "\n".join(lines)
+
+                        boxes_desc = _format_boxes_for_prompt(candidates)
+                        if self.verbose:
+                            print("[second-pass] boxes description:\n" + boxes_desc)
+
+                        # Create an instruction that asks the model to choose one box and output a single click
+                        # Keep style consistent with attention-click prompt (only pyautogui commands)
+                        pick_instr = (
+                            "You now have 4 candidate regions (Box 1..4).\n"
+                            "Pick the single best box and output exactly one line:\n"
+                            "pyautogui.click(x=<int>, y=<int>)\n"
+                            "No other text."
+                        )
+
+                        # Rebuild a conversation for the picking step including prior context
+                        pick_conv = conv_templates[conv_mode].copy()
+                        if context_steps > 0:
+                            for u, a in history[-int(context_steps):]:
+                                pick_conv.append_message(pick_conv.roles[0], u)
+                                pick_conv.append_message(pick_conv.roles[1], a)
+
+                        pick_user = (
+                            DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN + "\n"
+                            if getattr(model.config, "mm_use_im_start_end", False)
+                            else DEFAULT_IMAGE_TOKEN + "\n"
+                        )
+                        # Include the original action, the model's first answer, and the compact boxes list
+                        pick_user += (
+                            f"Action: {action_text}\n"
+                            f"First pass: {pred_text}\n"
+                            f"Candidates:\n{boxes_desc}\n\n{pick_instr}"
+                        )
+
+                        pick_conv.append_message(pick_conv.roles[0], pick_user)
+                        pick_conv.append_message(pick_conv.roles[1], None)
+                        pick_prompt = pick_conv.get_prompt()
+
+                        pick_ids = tokenizer_image_token(
+                            pick_prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt"
+                        ).unsqueeze(0).to(device)
+
+                        with torch.inference_mode():
+                            pick_out = model.generate(
+                                pick_ids,
+                                images=image_tensor,
+                                image_sizes=[pil_img.size],
+                                do_sample=False,
+                                temperature=0.0,
+                                max_new_tokens=32,
+                                use_cache=True,
+                            )
+                        pick_text = tokenizer.batch_decode(pick_out, skip_special_tokens=True)[0].strip()
+                        if self.verbose:
+                            try:
+                                gen2 = pick_out.shape[1] - pick_ids.shape[1] if pick_out.shape[1] >= pick_ids.shape[1] else pick_out.shape[1]
+                                print(f"[second-pass] output_ids shape: {pick_out.shape}, generated tokens: {gen2}")
+                            except Exception:
+                                pass
+                            print("[second-pass] raw selection output:")
+                            print("  " + repr(pick_text))
+
+                        # Extract final click command from the second pass
+                        final_pick_cmds = _extract_pyautogui_lines(pick_text)
+
+                        if self.verbose:
+                            print("Refined (second pass):")
+                            if not final_pick_cmds and pick_text:
+                                print("  [DEBUG] Raw refined output (no pyautogui found):")
+                                print(f"  [DEBUG] {repr(pick_text)}")
+                            for ln in final_pick_cmds:
+                                print("  ", ln)
+                    else:
+                        if self.verbose:
+                            print("[second-pass] No candidates generated from heatmap; skipping selection")
+                except Exception as exc:
+                    if self.verbose:
+                        print(f"[second-pass] Skipped due to error: {exc}")
+
+            # Score: count of expected commands matched by prediction (first-pass)
             step_hits = 0
             if exp_cmds:
                 total_expected += len(exp_cmds)
@@ -606,6 +889,17 @@ class GuiBench:
                         step_hits += 1
                 matched += step_hits
 
+            # If a refined single click was produced, print a final convenience line
+            if final_pick_cmds:
+                try:
+                    # Print only the first refined click as the final action suggestion
+                    print("Final:")
+                    print(f"  {final_pick_cmds[0]}")
+                    if self.verbose:
+                        print("[second-pass] Using first refined command as final suggestion")
+                except Exception:
+                    pass
+
         accuracy = (matched / total_expected) if total_expected > 0 else 0.0
         return GuiBenchResult(
             trajectory_dir=self.trajectory_dir,
@@ -615,3 +909,310 @@ class GuiBench:
             matched_actions=matched,
             accuracy=accuracy,
         )
+
+
+# -------------------------
+# Heatmap helpers (mirrors predict.py)
+# -------------------------
+
+def _model_device(model):
+    try:
+        return next(model.parameters()).device
+    except StopIteration:
+        import torch
+        return torch.device("cpu")
+
+
+def _infer_patch_grid(model, num_tokens: int):
+    tower = model.get_model().get_vision_tower()
+    if isinstance(tower, list):
+        tower = tower[0]
+    side = getattr(tower, "num_patches_per_side", None)
+    if isinstance(side, int) and side * side == num_tokens:
+        return side, side
+    root = int(math.sqrt(num_tokens))
+    for height in range(root, 0, -1):
+        if num_tokens % height == 0:
+            return height, num_tokens // height
+    return num_tokens, 1
+
+
+def _extract_image_token_counts(model, image_tensor, image_size):
+    import torch
+    with torch.inference_mode():
+        features = model.encode_images(image_tensor)
+    if isinstance(features, tuple):
+        features = features[0]
+    if isinstance(features, (list, tuple)):
+        return [feat.shape[0] for feat in features]
+    if hasattr(features, "ndim"):
+        if features.ndim == 3:  # [B, N, D]
+            return [features[i].shape[0] for i in range(features.shape[0])]
+        if features.ndim == 2:  # [N, D]
+            return [features.shape[0]]
+    raise ValueError("Unsupported vision feature shape for heatmap extraction.")
+
+
+def _build_image_token_mask(sequence_tokens, image_token_counts, total_length, device):
+    import torch
+    if not image_token_counts:
+        return None
+    mask = torch.zeros(total_length, dtype=torch.bool, device=device)
+    cursor = 0
+    image_idx = 0
+    from llava.constants import IMAGE_TOKEN_INDEX
+    for token in sequence_tokens:
+        if cursor >= total_length:
+            break
+        if token == IMAGE_TOKEN_INDEX:
+            if image_idx >= len(image_token_counts):
+                break
+            count = int(image_token_counts[image_idx])
+            end = min(cursor + count, total_length)
+            mask[cursor:end] = True
+            cursor = end
+            image_idx += 1
+        else:
+            cursor += 1
+    return mask if mask.any() else None
+
+
+def _extract_attention_heatmap(
+    model,
+    prompt_ids,
+    image_tensor,
+    image_size,
+    layer_index: int = -1,
+    query_last_n: Optional[int] = None,
+):
+    import torch
+    device = _model_device(model)
+
+    # Force eager attention to get full attention maps
+    original_attn_impl = None
+    attn_setter = getattr(model, "set_attn_implementation", None)
+    used_setter = False
+    if attn_setter is not None:
+        try:
+            current_impl = getattr(model.config, "_attn_implementation", None)
+            if current_impl != "eager":
+                original_attn_impl = current_impl
+                attn_setter("eager")
+                used_setter = True
+        except Exception:
+            pass
+    elif hasattr(model.config, "_attn_implementation"):
+        current_impl = getattr(model.config, "_attn_implementation")
+        if current_impl != "eager":
+            original_attn_impl = current_impl
+            model.config._attn_implementation = "eager"
+
+    try:
+        with torch.inference_mode():
+            (
+                _,
+                position_ids,
+                attention_mask,
+                _,
+                inputs_embeds,
+                _,
+            ) = model.prepare_inputs_labels_for_multimodal(
+                prompt_ids,
+                None,
+                None,
+                None,
+                None,
+                image_tensor,
+                image_sizes=[image_size],
+            )
+
+        inputs_embeds = inputs_embeds.to(device)
+        if position_ids is not None:
+            position_ids = position_ids.to(device)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device)
+            valid_len = int(attention_mask[0].sum().item())
+        else:
+            valid_len = inputs_embeds.shape[1]
+
+        outputs = model(
+            input_ids=None,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            output_attentions=True,
+            return_dict=True,
+        )
+    finally:
+        if original_attn_impl is not None:
+            try:
+                if used_setter and attn_setter is not None:
+                    attn_setter(original_attn_impl)
+                elif hasattr(model.config, "_attn_implementation"):
+                    model.config._attn_implementation = original_attn_impl
+            except Exception:
+                pass
+
+    attentions = outputs.attentions
+    if not attentions:
+        return None
+
+    layer_count = len(attentions)
+    layer_idx = layer_index if layer_index >= 0 else layer_count + layer_index
+    layer_idx = max(0, min(layer_idx, layer_count - 1))
+
+    layer_attn = attentions[layer_idx][0]
+    layer_attn = layer_attn[:, :valid_len, :valid_len]
+    layer_attn = torch.nan_to_num(layer_attn, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Aggregate attention from the last N tokens (default: last token)
+    qlen = int(query_last_n) if (query_last_n is not None and int(query_last_n) > 0) else 1
+    qlen = min(qlen, layer_attn.shape[1])
+    q_start = layer_attn.shape[1] - qlen
+    attn_vec = layer_attn[:, q_start:, :]  # [heads, qlen, seq_len]
+    attn_mean = attn_vec.mean(dim=(0, 1))  # average over heads and selected query tokens -> [seq_len]
+    attn_mean = torch.nan_to_num(attn_mean, nan=0.0, posinf=0.0, neginf=0.0)
+
+    sequence_tokens = prompt_ids[0].tolist()
+    image_token_counts = _extract_image_token_counts(model, image_tensor, image_size)
+    mask = _build_image_token_mask(sequence_tokens, image_token_counts, layer_attn.shape[-1], attn_mean.device)
+    if mask is None:
+        return None
+
+    image_attn = attn_mean[mask]
+    grid_h, grid_w = _infer_patch_grid(model, image_attn.shape[0])
+    if grid_h * grid_w != image_attn.shape[0]:
+        return None
+    return image_attn.reshape(grid_h, grid_w).to(torch.float32)
+
+
+def _parse_coordinates_from_command(cmd: str) -> Optional[Tuple[float, float]]:
+    """Extract x, y coordinates from a pyautogui command.
+    
+    Supports formats like:
+    - pyautogui.click(x=0.5, y=0.3)
+    - pyautogui.moveTo(x=100, y=200)
+    - pyautogui.click  # attention-click format (no coords)
+    
+    Returns coordinates as (x, y) or None if not a coordinate-based command.
+    """
+    if not cmd or "pyautogui" not in cmd.lower():
+        return None
+    
+    # Check if this is a coordinate-based command
+    coordinate_funcs = {"click", "moveto", "dragto", "doubleclick", "rightclick"}
+    func_name = None
+    for func in coordinate_funcs:
+        if f"pyautogui.{func}" in cmd.lower():
+            func_name = func
+            break
+    
+    if not func_name:
+        return None
+    
+    # Try to extract x= and y= parameters
+    import re
+    x_match = re.search(r'x\s*=\s*([-+]?\d*\.?\d+)', cmd, re.IGNORECASE)
+    y_match = re.search(r'y\s*=\s*([-+]?\d*\.?\d+)', cmd, re.IGNORECASE)
+    
+    if x_match and y_match:
+        try:
+            x = float(x_match.group(1))
+            y = float(y_match.group(1))
+            return (x, y)
+        except ValueError:
+            pass
+    
+    return None
+
+
+def _render_heatmap_overlay(image, heatmap, alpha: float, mode: str = "smooth", ground_truth_coords: Optional[Tuple[float, float]] = None):
+    if heatmap is None:
+        return None
+    import numpy as np
+    import torch
+    from PIL import Image, ImageDraw
+    
+    alpha = max(0.0, min(float(alpha), 1.0))
+    heat = heatmap
+    finite_mask = torch.isfinite(heat)
+    if finite_mask.any():
+        minv = heat[finite_mask].min()
+        heat = heat - minv
+        maxv = heat[finite_mask].max()
+        if maxv > 0:
+            heat = heat / maxv
+    else:
+        heat = torch.zeros_like(heat)
+    heat = heat.unsqueeze(0).unsqueeze(0)
+    interp_mode = "bilinear" if mode != "tile" else "nearest"
+    alignable = {"linear", "bilinear", "bicubic", "trilinear"}
+    interp_kwargs = {}
+    if interp_mode in alignable:
+        interp_kwargs["align_corners"] = False
+    heat = torch.nn.functional.interpolate(
+        heat,
+        size=(image.height, image.width),
+        mode=interp_mode,
+        **interp_kwargs,
+    ).squeeze(0).squeeze(0).detach().cpu().numpy()
+    heat = np.nan_to_num(heat, nan=0.0, posinf=1.0, neginf=0.0)
+
+    base = np.array(image.convert("RGB")).astype(np.float32)
+    heat = np.clip(heat, 0.0, 1.0)[..., None]
+    alpha_map = heat * alpha
+    color = np.array([255.0, 0.0, 0.0], dtype=np.float32)
+    overlay = base * (1.0 - alpha_map) + color * alpha_map
+    overlay = np.clip(overlay, 0, 255).astype(np.uint8)
+    result = Image.fromarray(overlay)
+    
+    # Draw ground truth coordinate marker if provided
+    if ground_truth_coords is not None:
+        x, y = ground_truth_coords
+        # Convert normalized coordinates (0-1) to pixel coordinates if needed
+        if 0 <= x <= 1 and 0 <= y <= 1:
+            pixel_x = int(x * image.width)
+            pixel_y = int(y * image.height)
+        else:
+            pixel_x = int(x)
+            pixel_y = int(y)
+        
+        # Draw a cyan circle with white outline to mark ground truth
+        draw = ImageDraw.Draw(result)
+        radius = 12
+        # White outer circle for visibility
+        draw.ellipse(
+            [(pixel_x - radius - 2, pixel_y - radius - 2),
+             (pixel_x + radius + 2, pixel_y + radius + 2)],
+            outline="white",
+            width=3
+        )
+        # Cyan inner circle
+        draw.ellipse(
+            [(pixel_x - radius, pixel_y - radius),
+             (pixel_x + radius, pixel_y + radius)],
+            fill="cyan",
+            outline="black",
+            width=2
+        )
+    
+    return result
+
+
+def _resolve_heatmap_path(target, image_path, expects_multiple: bool):
+    if target is None:
+        return None
+    is_directory = (
+        expects_multiple
+        or target.endswith(os.sep)
+        or os.path.isdir(target)
+        or os.path.splitext(target)[1] == ""
+    )
+    if is_directory:
+        os.makedirs(target, exist_ok=True)
+        stem = os.path.splitext(os.path.basename(image_path))[0]
+        return os.path.join(target, f"{stem}_heatmap.png")
+    parent = os.path.dirname(target)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    return target
