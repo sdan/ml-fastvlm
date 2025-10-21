@@ -140,7 +140,18 @@ class LlavaMetaForCausalLM(ABC):
 
     def encode_images(self, images):
         image_features = self.get_model().get_vision_tower()(images)
-        image_features = self.get_model().mm_projector(image_features)
+        # Ensure features match mm_projector's device and dtype to avoid matmul dtype mismatch
+        projector = self.get_model().mm_projector
+        try:
+            proj_param = next(projector.parameters())
+            target_device = proj_param.device
+            target_dtype = proj_param.dtype
+            if image_features.device != target_device or image_features.dtype != target_dtype:
+                image_features = image_features.to(device=target_device, dtype=target_dtype)
+        except StopIteration:
+            # Projector may be an identity/no-parameter module; no casting needed
+            pass
+        image_features = projector(image_features)
         return image_features
 
     def prepare_inputs_labels_for_multimodal(

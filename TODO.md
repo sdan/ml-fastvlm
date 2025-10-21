@@ -1,9 +1,9 @@
-# Research TODO - Differential Vision for Computer-Use Agents
+# Research TODO - Computer-Use Agent Optimizations
 
-## 1. Differential Vision Encoding
+## Feature 1: Differential Vision Encoding (Speed Optimization)
 
 ### Concept
-Instead of re-encoding full screenshots at each conversational turn in computer-use agents, explore encoding only the changed patches/regions to improve speed.
+Optimize multi-frame vision encoding by caching features and only encoding changed patches between frames.
 
 ### Technical Questions to Investigate
 - **Feasibility of Feature Caching**: Can we cache the image encoder's output features from previous frames?
@@ -30,10 +30,16 @@ Instead of re-encoding full screenshots at each conversational turn in computer-
 
 ---
 
-## 2. Attention Heatmap-Based Click Targeting
+## Feature 2: Attention-Based Click Targeting (Action Guidance)
 
 ### Concept
-Use the last layer attention heatmap from the vision model to automatically generate bounding boxes around regions of interest, then use these to guide click actions.
+Use attention patterns from the vision model to identify and rank clickable regions, improving click accuracy and interpretability.
+
+### Architecture
+These two features are **independent and orthogonal**:
+- Differential encoding handles the "input optimization" problem
+- Attention-based clicking handles the "output guidance" problem
+- Can be used separately or together
 
 ### Technical Approach
 - Extract attention weights from the final transformer layer before decoding
