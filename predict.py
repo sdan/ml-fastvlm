@@ -158,7 +158,14 @@ def _build_image_token_mask(sequence_tokens, image_token_counts, total_length, d
     return mask if mask.any() else None
 
 
-def _extract_attention_heatmap(model, prompt_ids, image_tensor, image_size, layer_index: int = -1):
+def _extract_attention_heatmap(
+    model,
+    prompt_ids,
+    image_tensor,
+    image_size,
+    layer_index: int = -1,
+    layer_average_k: int = 1,
+):
     """
     Build an attention heatmap over image patches from a single forward pass.
 
@@ -254,14 +261,23 @@ def _extract_attention_heatmap(model, prompt_ids, image_tensor, image_size, laye
     if not attentions:
         return None
 
-    # Pick the requested layer (supports negative indices)
+    # Pick the requested layer (supports negative indices) and optionally average over last K layers
     layer_count = len(attentions)
-    layer_idx = layer_index if layer_index >= 0 else layer_count + layer_index
-    layer_idx = max(0, min(layer_idx, layer_count - 1))
+    end_idx = layer_index if layer_index >= 0 else layer_count + layer_index
+    end_idx = max(0, min(end_idx, layer_count - 1))
+    k = max(1, int(layer_average_k or 1))
+    start_idx = max(0, end_idx - (k - 1))
 
-    # Attentions: [num_heads, seq_len, seq_len]
-    layer_attn = attentions[layer_idx][0]
-    layer_attn = layer_attn[:, :valid_len, :valid_len]
+    # Each element has shape [batch, num_heads, seq_len, seq_len]; take batch 0 and crop to valid_len
+    if start_idx == end_idx:
+        layer_attn = attentions[end_idx][0]
+        layer_attn = layer_attn[:, :valid_len, :valid_len]
+    else:
+        chunks = []
+        for li in range(start_idx, end_idx + 1):
+            att = attentions[li][0][:, :valid_len, :valid_len]
+            chunks.append(att)
+        layer_attn = torch.stack(chunks, dim=0).mean(dim=0)
 
     # Sanitize backend anomalies
     layer_attn = torch.nan_to_num(layer_attn, nan=0.0, posinf=0.0, neginf=0.0)
@@ -609,6 +625,7 @@ def predict(args):
                             image_tensor,
                             image.size,
                             layer_index=args.heatmap_layer,
+                            layer_average_k=max(1, int(getattr(args, 'heatmap_layer_avg_k', 1) or 1)),
                         )
                         overlay = _render_heatmap_overlay(
                             image, heatmap, alpha=args.heatmap_alpha, mode=getattr(args, "heatmap_mode", "smooth")
@@ -725,6 +742,12 @@ if __name__ == "__main__":
         type=int,
         default=-1,
         help="Transformer layer index for attention heatmap (default: last layer).",
+    )
+    parser.add_argument(
+        "--heatmap-layer-avg-k",
+        type=int,
+        default=1,
+        help="Average attention over the last K layers ending at --heatmap-layer.",
     )
     parser.add_argument(
         "--heatmap-alpha",

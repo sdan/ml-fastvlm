@@ -119,6 +119,7 @@ class AttentionExtractor:
                                  image_tensor: torch.Tensor,
                                  image_size: Tuple[int, int],
                                  layer_index: int = -1,
+                                 layer_average_k: int = 1,
                                  query_strategy: str = 'last',
                                  return_raw: bool = False) -> Optional[torch.Tensor]:
         """
@@ -177,10 +178,21 @@ class AttentionExtractor:
             if not outputs.attentions:
                 return None
             
-            # Extract attention from specified layer
+            # Extract attention from specified layer, optionally averaged over last K layers
             attentions = outputs.attentions
-            layer_idx = layer_index if layer_index >= 0 else len(attentions) + layer_index
-            layer_attn = attentions[layer_idx][0][:, :valid_len, :valid_len]
+            total_layers = len(attentions)
+            end_idx = layer_index if layer_index >= 0 else total_layers + layer_index
+            end_idx = max(0, min(end_idx, total_layers - 1))
+            k = max(1, int(layer_average_k or 1))
+            start_idx = max(0, end_idx - (k - 1))
+
+            if start_idx == end_idx:
+                layer_attn = attentions[end_idx][0][:, :valid_len, :valid_len]
+            else:
+                pieces = []
+                for li in range(start_idx, end_idx + 1):
+                    pieces.append(attentions[li][0][:, :valid_len, :valid_len])
+                layer_attn = torch.stack(pieces, dim=0).mean(dim=0)
 
             # Debug: Check layer attention
             print(f"DEBUG: layer_attn shape={layer_attn.shape}, valid_len={valid_len}")

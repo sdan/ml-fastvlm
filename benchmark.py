@@ -650,15 +650,20 @@ class GuiBench:
                             attn_prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt"
                         ).unsqueeze(0).to(device)
 
-                        # Aggregate attention over all generated tokens in this step
-                        gen_token_count = max(1, int(attn_ids.shape[1] - input_ids.shape[1]))
-                        heatmap = _extract_attention_heatmap(
+                        # Fused multi-layer vector rollout using user-last query strategy
+                        heatmap = _extract_pointer_heatmap(
                             model,
                             attn_ids,
                             image_tensor,
                             pil_img.size,
-                            layer_index=int(default_layer),
-                            query_last_n=gen_token_count,
+                            user_input_len=input_ids.shape[1],
+                            last_k_layers=6,
+                            query_strategy="action",
+                            query_last_k=8,
+                            sparse_norm="sparsemax",
+                            head_weighting=True,
+                            tokenizer=tokenizer,
+                            action_text=action_text,
                         )
                         last_heatmap = heatmap
                         if self.verbose and heatmap is not None:
@@ -669,6 +674,25 @@ class GuiBench:
                                 print(f"[heatmap] stats: shape={list(heatmap.shape)}, min={hmin:.4f}, max={hmax:.4f}, mean={hmean:.4f}")
                             except Exception:
                                 pass
+                        # Optional quick A/B metric: pixel distance from peak to ground truth
+                        if heatmap is not None and gt_coords is not None:
+                            import torch as _torch
+                            yx = _torch.stack(_torch.meshgrid(
+                                _torch.arange(heatmap.shape[0]),
+                                _torch.arange(heatmap.shape[1]),
+                                indexing="ij"
+                            ), dim=-1).reshape(-1, 2).to(_torch.float32)
+                            idx = heatmap.view(-1).argmax().item()
+                            peak = yx[idx]
+                            peak_px = (peak[1] * pil_img.width / heatmap.shape[1],
+                                       peak[0] * pil_img.height / heatmap.shape[0])
+                            gx, gy = gt_coords
+                            if 0 <= gx <= 1 and 0 <= gy <= 1:
+                                gt_px = (gx * pil_img.width, gy * pil_img.height)
+                            else:
+                                gt_px = (gx, gy)
+                            dist = ((peak_px[0] - gt_px[0]) ** 2 + (peak_px[1] - gt_px[1]) ** 2) ** 0.5
+                            print(f"[pointer] pixel_distance={dist:.1f}")
                         # Build heatmap overlay, drawing candidate boxes as well
                         overlay = None
                         if heatmap is not None:
@@ -717,6 +741,97 @@ class GuiBench:
                                         outline="black",
                                         width=2,
                                     )
+
+                                # Additionally: run a second pass using the default (parentheses) style
+                                # to obtain the model's predicted coordinates, and mark them on the heatmap.
+                                try:
+                                    # Build default-style instruction (with parentheses examples)
+                                    default_instr = (
+                                        "You are a helpful multi-modal assistant controlling a GUI via pyautogui commands only.\n"
+                                        "Output ONLY valid pyautogui commands. Use normalized coordinates (0.0 to 1.0).\n"
+                                        "Command formats:\n"
+                                        "pyautogui.click(x=<screen_x>, y=<screen_y>)\n"
+                                        "pyautogui.rightClick(x=<screen_x>, y=<screen_y>)\n"
+                                        "pyautogui.doubleClick(x=<screen_x>, y=<screen_y>)\n"
+                                        "pyautogui.moveTo(x=<screen_x>, y=<screen_y>)\n"
+                                        "pyautogui.dragTo(x=<screen_x>, y=<screen_y>)\n"
+                                        "pyautogui.write(message='<text>')\n"
+                                        "pyautogui.press('<key_name>')\n"
+                                        "pyautogui.hotkey('<key1>', '<key2>')\n"
+                                        "pyautogui.scroll(<amount>)\n"
+                                        "pyautogui.hscroll(<amount>)\n\n"
+                                        "Action:"
+                                    )
+                                    user_plain_default = f"{default_instr}\n{action_text}"
+
+                                    # Rebuild conversation for the default-style pass (stateless or with requested context)
+                                    norm_conv = conv_templates[conv_mode].copy()
+                                    if context_steps > 0:
+                                        for u, a in history[-int(context_steps):]:
+                                            norm_conv.append_message(norm_conv.roles[0], u)
+                                            norm_conv.append_message(norm_conv.roles[1], a)
+                                    norm_user = (
+                                        DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN + "\n" + user_plain_default
+                                        if getattr(model.config, "mm_use_im_start_end", False)
+                                        else DEFAULT_IMAGE_TOKEN + "\n" + user_plain_default
+                                    )
+                                    norm_conv.append_message(norm_conv.roles[0], norm_user)
+                                    norm_conv.append_message(norm_conv.roles[1], None)
+                                    norm_prompt = norm_conv.get_prompt()
+
+                                    norm_ids = tokenizer_image_token(
+                                        norm_prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt"
+                                    ).unsqueeze(0).to(device)
+
+                                    with torch.inference_mode():
+                                        norm_out = model.generate(
+                                            norm_ids,
+                                            images=image_tensor,
+                                            image_sizes=[pil_img.size],
+                                            do_sample=bool(temperature) and temperature > 0,
+                                            temperature=float(temperature),
+                                            top_p=top_p,
+                                            num_beams=num_beams,
+                                            max_new_tokens=64,
+                                            use_cache=True,
+                                        )
+
+                                    norm_text = tokenizer.batch_decode(norm_out, skip_special_tokens=True)[0].strip()
+                                    norm_cmds = _extract_pyautogui_lines(norm_text)
+                                    # Pick the first coordinate-based command
+                                    pred_coords = None
+                                    for cmd in norm_cmds:
+                                        pred_coords = _parse_coordinates_from_command(cmd)
+                                        if pred_coords is not None:
+                                            break
+
+                                    if pred_coords is not None:
+                                        mx, my = pred_coords
+                                        # Normalize to pixel space if input is 0..1
+                                        if 0.0 <= mx <= 1.0 and 0.0 <= my <= 1.0:
+                                            mx_px = int(round(mx * pil_img.width))
+                                            my_px = int(round(my * pil_img.height))
+                                        else:
+                                            mx_px = int(round(mx))
+                                            my_px = int(round(my))
+
+                                        # Draw predicted marker in a distinct color (magenta with white outline)
+                                        draw = ImageDraw.Draw(overlay)
+                                        pr = 10
+                                        draw.ellipse(
+                                            [(mx_px - pr - 2, my_px - pr - 2), (mx_px + pr + 2, my_px + pr + 2)],
+                                            outline="white",
+                                            width=3,
+                                        )
+                                        draw.ellipse(
+                                            [(mx_px - pr, my_px - pr), (mx_px + pr, my_px + pr)],
+                                            fill="magenta",
+                                            outline="black",
+                                            width=2,
+                                        )
+                                except Exception as _exc_pred_marker:
+                                    if self.verbose:
+                                        print(f"[heatmap] predicted-dot overlay skipped: {_exc_pred_marker}")
                             except Exception:
                                 # Fallback to plain heatmap overlay if candidate drawing fails
                                 overlay = _render_heatmap_overlay(
@@ -1216,3 +1331,234 @@ def _resolve_heatmap_path(target, image_path, expects_multiple: bool):
     if parent:
         os.makedirs(parent, exist_ok=True)
     return target
+
+# -------------------------
+# Pointer rollout helpers
+# -------------------------
+
+def _sparsemax(logits, dim=-1, eps=1e-12):
+    import torch
+    z = logits - logits.max(dim=dim, keepdim=True).values
+    zs = torch.sort(z, dim=dim, descending=True).values
+    range_ = torch.arange(1, zs.size(dim) + 1, device=zs.device, dtype=zs.dtype).view(
+        *([1] * (zs.dim() - 1)), -1
+    )
+    cumsum = zs.cumsum(dim=dim)
+    cond = zs > (cumsum - 1) / range_
+    k = cond.sum(dim=dim, keepdim=True).clamp(min=1)
+    tau = (cumsum.gather(dim, k - 1) - 1) / k
+    return torch.clamp(z - tau, min=0.0)
+
+
+def _select_query_indices(strategy, attn_len, user_len, gen_len, last_k=8):
+    """
+    Returns a 1D LongTensor of query token indices in [0, attn_len).
+    user_len: tokens up to and including the end of the USER message.
+    gen_len: number of assistant-generated tokens appended.
+    """
+    import torch
+    if strategy == "assistant_last":
+        qlen = max(1, min(int(gen_len), int(last_k)))
+        return torch.arange(attn_len - qlen, attn_len, device="cpu")
+    elif strategy == "user_last":
+        qlen = min(int(last_k), int(user_len))
+        return torch.arange(int(user_len) - qlen, int(user_len), device="cpu")
+    else:
+        qlen = min(int(last_k), int(user_len))
+        return torch.arange(int(user_len) - qlen, int(user_len), device="cpu")
+
+
+def _tokenize_plain(tokenizer, text: str):
+    # Tokenize without adding BOS/EOS
+    ids = tokenizer(text, add_special_tokens=False).input_ids
+    return ids
+
+
+def _find_subsequence_indices(haystack_ids, needle_ids):
+    """Return all start indices where needle occurs in haystack."""
+    matches = []
+    if not needle_ids or len(needle_ids) > len(haystack_ids):
+        return matches
+    for i in range(0, len(haystack_ids) - len(needle_ids) + 1):
+        if haystack_ids[i : i + len(needle_ids)] == needle_ids:
+            matches.append(i)
+    return matches
+
+
+def _select_action_token_indices(attn_ids, user_input_len, tokenizer, action_text: str):
+    """
+    Find token indices (in attn_ids) that correspond to `action_text` within the user turn
+    (positions < user_input_len). Returns a 1D LongTensor (may be empty).
+    """
+    import torch
+    user_ids = attn_ids[0, : int(user_input_len)].tolist()
+    cand_texts = [
+        action_text,
+        action_text.strip().strip('"').strip("'"),
+        f'"{action_text}"',
+        f"'{action_text}'",
+    ]
+    hits = []
+    for t in cand_texts:
+        needle = _tokenize_plain(tokenizer, t)
+        if not needle:
+            continue
+        starts = _find_subsequence_indices(user_ids, needle)
+        for s in starts:
+            hits.extend(range(s, s + len(needle)))
+        if hits:
+            break
+    if not hits:
+        return torch.empty(0, dtype=torch.long)
+    return torch.tensor(sorted(set(hits)), dtype=torch.long)
+
+
+def _extract_pointer_heatmap(
+    model,
+    attn_ids,              # ids for [user message (+ image)] + assistant text (optional)
+    image_tensor,
+    image_size,            # (W, H)
+    *,
+    user_input_len,        # length of ids up to end of user turn (no assistant)
+    last_k_layers=6,
+    query_strategy="user_last",    # "user_last" | "assistant_last" | "action"
+    query_last_k=8,
+    sparse_norm="sparsemax",       # "sparsemax" | None
+    head_weighting=True,
+    tokenizer=None,
+    action_text=None,
+):
+    """
+    Vector rollout over the last K layers, returns [Hgrid, Wgrid] float heatmap on image tokens.
+    """
+    import torch
+    device = _model_device(model)
+
+    # Force eager attention to expose maps
+    original_attn_impl, attn_setter, used_setter = None, getattr(model, "set_attn_implementation", None), False
+    try:
+        current_impl = getattr(model.config, "_attn_implementation", None)
+        if current_impl != "eager":
+            original_attn_impl = current_impl
+            if attn_setter:
+                attn_setter("eager"); used_setter = True
+            else:
+                model.config._attn_implementation = "eager"
+    except Exception:
+        pass
+
+    try:
+        with torch.inference_mode():
+            (
+                _,
+                position_ids,
+                attention_mask,
+                _,
+                inputs_embeds,
+                _,
+            ) = model.prepare_inputs_labels_for_multimodal(
+                attn_ids, None, None, None, None, image_tensor, image_sizes=[image_size]
+            )
+        inputs_embeds = inputs_embeds.to(device)
+        if position_ids is not None:
+            position_ids = position_ids.to(device)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device)
+            valid_len = int(attention_mask[0].sum().item())
+        else:
+            valid_len = inputs_embeds.shape[1]
+
+        # Forward with attentions
+        outputs = model(
+            input_ids=None,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            output_attentions=True,
+            return_dict=True,
+        )
+        attn_stack = outputs.attentions  # list length L: [B=1, H, T, T]
+        if not attn_stack:
+            return None
+
+        L = len(attn_stack)
+        K = max(1, min(int(last_k_layers), L))
+        layer_ids = list(range(L - K, L))
+
+        # Build image mask over sequence positions at this step
+        sequence_tokens = attn_ids[0].tolist()
+        image_token_counts = _extract_image_token_counts(model, image_tensor, image_size)
+        img_mask = _build_image_token_mask(sequence_tokens, image_token_counts, valid_len, device=device)
+        if img_mask is None or not img_mask.any():
+            return None
+
+        # Query indices
+        gen_len = int(attn_ids.shape[1] - int(user_input_len))
+        if query_strategy == "action" and tokenizer is not None and action_text:
+            q_idx = _select_action_token_indices(attn_ids, int(user_input_len), tokenizer, action_text).to(device)
+            if q_idx.numel() == 0:
+                q_idx = _select_query_indices("user_last", valid_len, int(user_input_len), gen_len, last_k=int(query_last_k)).to(device)
+        elif query_strategy == "assistant_last":
+            q_idx = _select_query_indices("assistant_last", valid_len, int(user_input_len), gen_len, last_k=int(query_last_k)).to(device)
+        else:
+            q_idx = _select_query_indices("user_last", valid_len, int(user_input_len), gen_len, last_k=int(query_last_k)).to(device)
+
+        # Init rollout vector r0: average one-hot over chosen queries
+        r = torch.zeros(valid_len, device=device, dtype=inputs_embeds.dtype)
+        denom = max(1, int(q_idx.numel()))
+        if denom > 0:
+            r[q_idx] = 1.0 / float(denom)
+
+        # Roll through layers
+        for lid in layer_ids:
+            A = attn_stack[lid][0][:, :valid_len, :valid_len]  # [H, T, T]
+            A = torch.nan_to_num(A, nan=0.0, posinf=0.0, neginf=0.0)
+
+            # Head weighting by image focus for this query distribution
+            if head_weighting:
+                # r @ A_h -> [T] for each head h; measure mass on image tokens
+                v = torch.einsum('t,htt->ht', r, A)  # [H, T]
+                focus = v[:, img_mask].mean(dim=1)  # [H]
+                denom = (focus.sum() + 1e-8)
+                if denom.item() == 0.0:
+                    w = torch.ones_like(focus) / focus.numel()
+                else:
+                    w = (focus / denom).clamp(min=0.0)
+                A = (A * w.view(-1, 1, 1)).sum(dim=0)  # [T, T]
+            else:
+                A = A.mean(dim=0)
+
+            # Add identity and row-normalize (classic rollout)
+            A = A + torch.eye(valid_len, device=device, dtype=A.dtype)
+            A = A / (A.sum(dim=-1, keepdim=True) + 1e-8)
+
+            # r := r @ A
+            r = r @ A
+
+        # Keep image-token mass only, reshape to grid
+        r_img = r[img_mask]
+        grid_h, grid_w = _infer_patch_grid(model, r_img.shape[0])
+        if grid_h * grid_w != r_img.shape[0]:
+            return None
+
+        # Sparse normalization for crispness
+        if sparse_norm == "sparsemax":
+            r_img = _sparsemax(r_img, dim=0)
+
+        # Normalize to [0,1]
+        rmin = float(r_img.min().item())
+        rmax = float(r_img.max().item())
+        if rmax > rmin:
+            r_img = (r_img - rmin) / (rmax - rmin)
+        return r_img.reshape(grid_h, grid_w).to(torch.float32)
+
+    finally:
+        # Restore attention impl
+        if original_attn_impl is not None:
+            try:
+                if used_setter and attn_setter:
+                    attn_setter(original_attn_impl)
+                else:
+                    model.config._attn_implementation = original_attn_impl
+            except Exception:
+                pass

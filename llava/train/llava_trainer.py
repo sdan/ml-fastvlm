@@ -136,12 +136,18 @@ class LengthGroupedSampler(Sampler):
 
 class LLaVATrainer(Trainer):
 
-    def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
-        if self.train_dataset is None or not has_length(self.train_dataset):
+    def _get_train_sampler(self, dataset=None) -> Optional[torch.utils.data.Sampler]:
+        # Newer HF Trainer calls this as a sampler factory with the dataset argument.
+        # Keep backward compatibility by defaulting to self.train_dataset.
+        ds = dataset if dataset is not None else self.train_dataset
+        if ds is None or not has_length(ds):
             return None
 
         if self.args.group_by_modality_length:
-            lengths = self.train_dataset.modality_lengths
+            lengths = getattr(ds, 'modality_lengths', None)
+            if lengths is None:
+                # Fall back to default sampler if lengths are unavailable
+                return super()._get_train_sampler(dataset)
             return LengthGroupedSampler(
                 self.args.train_batch_size,
                 world_size=self.args.world_size * self.args.gradient_accumulation_steps,
@@ -149,7 +155,7 @@ class LLaVATrainer(Trainer):
                 group_by_modality=True,
             )
         else:
-            return super()._get_train_sampler()
+            return super()._get_train_sampler(dataset)
 
     def create_optimizer(self):
         """
@@ -262,7 +268,11 @@ class LLaVATrainer(Trainer):
         else:
             # Workaround for the issue: https://github.com/haotian-liu/LLaVA/issues/1144
             model.generation_config = transformers.GenerationConfig(do_sample=True, temperature=None, top_p=None)
-            super(LLaVATrainer, self)._save_checkpoint(model, trial, metrics)
+            # HF changed the _save_checkpoint signature across versions. Support both.
+            try:
+                super(LLaVATrainer, self)._save_checkpoint(model, trial, metrics)
+            except TypeError:
+                super(LLaVATrainer, self)._save_checkpoint(model, trial)
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         if getattr(self.args, 'tune_mm_mlp_adapter', False):

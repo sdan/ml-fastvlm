@@ -189,7 +189,17 @@ class LlavaMetaForCausalLM(ABC):
                             else:
                                 img_size = self.get_vision_tower().config.image_size
 
-                            num_patch_width, num_patch_height = get_anyres_image_grid_shape(image_sizes[image_idx], self.config.image_grid_pinpoints, img_size)
+                            num_patch_width, num_patch_height = get_anyres_image_grid_shape(
+                                image_sizes[image_idx], self.config.image_grid_pinpoints, img_size
+                            )
+                            if num_patch_width < 1 or num_patch_height < 1:
+                                raise ValueError(
+                                    f"AnyRes grid resolution too small for vision tower tile size: "
+                                    f"got grid {image_sizes[image_idx]} with tile_size={img_size}. "
+                                    f"Ensure each grid dimension is >= tile size and a multiple of it. "
+                                    f"Example: for tile_size={img_size}, use pinpoints like "
+                                    f"[( {img_size}, {img_size} ), ( {img_size*3//2}, {img_size} ), ( {img_size*3//2}, {img_size*3//2} )]."
+                                )
                             image_feature = image_feature.view(num_patch_height, num_patch_width, height, width, -1)
                         else:
                             raise NotImplementedError
@@ -247,6 +257,9 @@ class LlavaMetaForCausalLM(ABC):
 
         new_input_embeds = []
         new_labels = []
+        # Track per-sample visual embeddings actually inserted into the sequence
+        # so downstream modules (e.g., pointer head) can reuse them without re-encoding.
+        visual_embeds_by_sample = []
         cur_image_idx = 0
         for batch_idx, cur_input_ids in enumerate(input_ids):
             num_images = (cur_input_ids == IMAGE_TOKEN_INDEX).sum()
@@ -256,6 +269,7 @@ class LlavaMetaForCausalLM(ABC):
                 cur_input_embeds = torch.cat([cur_input_embeds_1, cur_image_features[0:0]], dim=0)
                 new_input_embeds.append(cur_input_embeds)
                 new_labels.append(labels[batch_idx])
+                visual_embeds_by_sample.append(cur_image_features[0:0])
                 cur_image_idx += 1
                 continue
 
@@ -271,6 +285,7 @@ class LlavaMetaForCausalLM(ABC):
             cur_input_embeds_no_im = torch.split(cur_input_embeds, split_sizes, dim=0)
             cur_new_input_embeds = []
             cur_new_labels = []
+            cur_visual_spans = []
 
             for i in range(num_images + 1):
                 cur_new_input_embeds.append(cur_input_embeds_no_im[i])
@@ -279,6 +294,7 @@ class LlavaMetaForCausalLM(ABC):
                     cur_image_features = image_features[cur_image_idx]
                     cur_image_idx += 1
                     cur_new_input_embeds.append(cur_image_features)
+                    cur_visual_spans.append(cur_image_features)
                     cur_new_labels.append(torch.full((cur_image_features.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
 
             cur_new_input_embeds = [x.to(self.device) for x in cur_new_input_embeds]
@@ -288,6 +304,11 @@ class LlavaMetaForCausalLM(ABC):
 
             new_input_embeds.append(cur_new_input_embeds)
             new_labels.append(cur_new_labels)
+            if len(cur_visual_spans) > 0:
+                visual_embeds_by_sample.append(torch.cat(cur_visual_spans, dim=0))
+            else:
+                # Ensure tensor type/device consistency if no images present
+                visual_embeds_by_sample.append(cur_new_input_embeds.new_empty((0, cur_new_input_embeds.shape[1])))
 
         # Truncate sequences to max length as image embeddings can make the sequence longer
         tokenizer_model_max_length = getattr(self.config, 'tokenizer_model_max_length', None)
@@ -339,6 +360,10 @@ class LlavaMetaForCausalLM(ABC):
 
         if _position_ids is None:
             position_ids = None
+
+        # Stash per-sample visual embeddings for use by higher-level modules (e.g., pointer head)
+        # Fail loudly if this assignment cannot be performed.
+        self._last_visual_embeds = visual_embeds_by_sample
 
         return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels
 
