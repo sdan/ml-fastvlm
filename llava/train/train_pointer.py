@@ -193,6 +193,16 @@ def train():
 
     smart_add_special_tokens(tokenizer, model)
 
+    # Ensure tokenizer/model truncation and padding-side are respected inside the multimodal arch.
+    try:
+        model.config.tokenizer_model_max_length = int(training_args.model_max_length)
+    except Exception:
+        pass
+    try:
+        model.config.tokenizer_padding_side = tokenizer.padding_side
+    except Exception:
+        pass
+
     # Initialize vision modules (FastViTHD / MobileCLIP) and wire projector
     model.get_model().initialize_vision_modules(model_args, fsdp=training_args.fsdp)
     vt = model.get_vision_tower()
@@ -245,7 +255,7 @@ def train():
 
     trainer = LLaVATrainer(
         model=model,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         args=training_args,
         **data_module,
     )

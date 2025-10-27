@@ -405,7 +405,7 @@ def visualize_with_labels(
 if __name__ == "__main__":
     # Hardcoded test setup from traj_0002 step 3
     model_id = "Qwen/Qwen3-VL-4B-Instruct"
-    image_path = "/home/sdan/workspace/diffcua/differential_vision/agentnet_curated/traj_0002/step_0003_5d2f0d08-fb03-486e-9d7f-9340658a1376.png"
+    image_path = "/home/sdan/storage/diffcua/differential_vision/agentnet_curated/traj_0002/step_0003_5d2f0d08-fb03-486e-9d7f-9340658a1376.png"
     user_instruction = "Click on the Save button for the healthy breakfast recipe"
     device = "cuda"
     layer_index = -1

@@ -7,7 +7,7 @@ NPROC=${NPROC:-2}
 MODEL_PATH=${MODEL_PATH:-"out/pointer_warmup"}   # warmup checkpoint
 VISION_TOWER=${VISION_TOWER:-"mobileclip_l_1024"}
 # Use GUI-Actor style YAML config listing multiple datasets
-DATA_CONFIG=${DATA_CONFIG:-"/home/sdan/workspace/GUI-Actor/data/data_config.yaml"}
+DATA_CONFIG=${DATA_CONFIG:-"GUI-Actor/data/data_config.yaml"}
 OUTPUT_DIR=${OUTPUT_DIR:-"out/pointer_sft"}
 
 TORCH_CMD=(python)

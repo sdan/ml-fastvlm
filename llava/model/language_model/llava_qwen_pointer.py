@@ -70,7 +70,21 @@ class VisionHead_MultiPatch(nn.Module):
         if labels is not None and not do_single_patch:
             epsilon = 1e-8
             labels_float = labels.float()
-            target_dist = labels_float / (labels_float.sum(dim=-1, keepdim=True) + epsilon)
+            row_sums = labels_float.sum(dim=-1, keepdim=True)
+            # Guard: ensure no all-zero rows (invalid probability distributions)
+            if (row_sums.squeeze(-1) < epsilon).any():
+                raise ValueError(
+                    f"Pointer supervision: found all-zero label rows. "
+                    f"Row sums: {row_sums.squeeze(-1).tolist()}. "
+                    f"Ensure coordinates/bboxes produce valid patch masks."
+                )
+            target_dist = labels_float / row_sums
+            # Validate target_dist is a valid probability distribution
+            if torch.isnan(target_dist).any() or torch.isinf(target_dist).any():
+                raise ValueError(
+                    f"Pointer supervision: target distribution contains NaN/Inf. "
+                    f"Labels shape: {labels.shape}, row_sums min: {row_sums.min().item()}"
+                )
             pred_log_probs = F.log_softmax(patch_logits, dim=-1)
             loss = F.kl_div(pred_log_probs, target_dist, reduction="batchmean")
         elif labels is not None and do_single_patch:
@@ -255,23 +269,49 @@ class LlavaQwen2ForCausalLMWithPointer(_BaseLlavaQwen2ForCausalLM):
                             infer_grid = root
                     if infer_grid is None or infer_grid <= 0:
                         raise ValueError(
-                            "Coordinates provided but grid size is unknown and cannot be inferred from visual token count."
+                            f"Coordinates provided but grid size is unknown and cannot be inferred from visual token count. "
+                            f"vlen={vlen}, grid_N={grid_N}"
                         )
                     # Validate normalized coordinates
                     for (x, y) in coordinates[i]:
                         if not (0.0 <= float(x) <= 1.0 and 0.0 <= float(y) <= 1.0):
                             raise ValueError(f"Coordinates must be normalized to [0,1], got ({x}, {y}).")
+                    # Warn if grid size doesn't match visual embeddings
+                    expected_vlen = infer_grid * infer_grid
+                    if expected_vlen != vlen:
+                        print(
+                            f"[warn] Grid size mismatch: grid_N={infer_grid} implies {expected_vlen} patches, "
+                            f"but visual_embeds has {vlen} tokens. Coordinates may be misaligned."
+                        )
                     tgt_cnt = len(coordinates[i])
                     labels_multi = torch.zeros((tgt_cnt, vlen), device=visual_embeds.device, dtype=torch.float32)
+                    marked_any = False
                     for r, (x, y) in enumerate(coordinates[i]):
                         x_idx = min(max(int(float(x) * infer_grid), 0), infer_grid - 1)
                         y_idx = min(max(int(float(y) * infer_grid), 0), infer_grid - 1)
                         idx = y_idx * infer_grid + x_idx
                         if 0 <= idx < vlen:
                             labels_multi[r, idx] = 1.0
+                            marked_any = True
+                        else:
+                            print(
+                                f"[warn] Coordinate ({x}, {y}) maps to idx={idx} which is out of bounds (vlen={vlen}). "
+                                f"Grid: {infer_grid}x{infer_grid}, computed indices: x={x_idx}, y={y_idx}"
+                            )
+                    if not marked_any:
+                        raise ValueError(
+                            f"Pointer supervision: no valid patches marked for sample {i} from coordinates. "
+                            f"Coordinates: {coordinates[i]}, grid_N: {infer_grid}, vlen: {vlen}"
+                        )
                 elif bboxes is not None and bboxes[i] is not None and grid_N is not None:
                     # Build binary mask over the grid for a bbox, replicate per target
                     vlen = visual_embeds.shape[0]
+                    expected_vlen = grid_N * grid_N
+                    if expected_vlen != vlen:
+                        print(
+                            f"[warn] Bbox grid size mismatch: grid_N={grid_N} implies {expected_vlen} patches, "
+                            f"but visual_embeds has {vlen} tokens. Bbox may be misaligned."
+                        )
                     # if we don't know the number of pointer targets, default to 1 row
                     tgt_cnt = target_hidden.shape[0]
                     labels_multi = torch.zeros((tgt_cnt, vlen), device=visual_embeds.device, dtype=torch.float32)
@@ -280,11 +320,18 @@ class LlavaQwen2ForCausalLMWithPointer(_BaseLlavaQwen2ForCausalLM):
                     y1i = min(max(int(y1 * grid_N), 0), grid_N - 1)
                     x2i = min(max(int(x2 * grid_N), 0), grid_N - 1)
                     y2i = min(max(int(y2 * grid_N), 0), grid_N - 1)
+                    marked_any = False
                     for yy in range(min(y1i, y2i), max(y1i, y2i) + 1):
                         for xx in range(min(x1i, x2i), max(x1i, x2i) + 1):
                             idx = yy * grid_N + xx
                             if idx < vlen:
                                 labels_multi[:, idx] = 1.0
+                                marked_any = True
+                    if not marked_any:
+                        raise ValueError(
+                            f"Pointer supervision: no valid patches marked for sample {i} from bbox. "
+                            f"Bbox: {bboxes[i]}, grid_N: {grid_N}, vlen: {vlen}"
+                        )
                 else:
                     raise ValueError(
                         "Pointer supervision requested but neither multi_patch_labels, coordinates, nor bboxes are provided for a sample."
