@@ -236,7 +236,7 @@ def train():
                     return grad * mask
 
                 embed_weight.register_hook(_mask_pointer_token_grad)
-        except Exception:
+        except Exception
             # If any tokenizer/id edge case occurs, skip masking rather than fail training
             pass
 

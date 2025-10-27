@@ -7,7 +7,8 @@ NPROC=${NPROC:-2}
 MODEL_PATH=${MODEL_PATH:-"out/pointer_warmup"}   # warmup checkpoint
 VISION_TOWER=${VISION_TOWER:-"mobileclip_l_1024"}
 # Use GUI-Actor style YAML config listing multiple datasets
-DATA_CONFIG=${DATA_CONFIG:-"/home/sdan/workspace/GUI-Actor/data/data_config.yaml"}
+# Default to a local config that points at /home/sdan/workspace/GUI-Actor/GUI-Actor-Data
+DATA_CONFIG=${DATA_CONFIG:-"scripts/data_config_local.yaml"}
 OUTPUT_DIR=${OUTPUT_DIR:-"out/pointer_sft"}
 
 TORCH_CMD=(python)
@@ -24,7 +25,8 @@ else
 fi
 TP1=$TILE_SIZE
 TP2=$((TILE_SIZE * 2))
-GRID_PINPOINTS="[("$TP1","$TP1"),("$TP2","$TP1"),("$TP2","$TP2")]"
+# Include portrait-friendly (T,2T) in addition to landscape options
+GRID_PINPOINTS="[("$TP1","$TP1"),("$TP2","$TP1"),("$TP1","$TP2"),("$TP2","$TP2")]"
 
 "${TORCH_CMD[@]}" -m llava.train.train_pointer \
   --deepspeed GUI-Actor/scripts/zero3.json \

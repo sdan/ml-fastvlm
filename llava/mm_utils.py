@@ -147,6 +147,84 @@ def process_anyres_image(image, processor, grid_pinpoints):
     return torch.stack(image_patches, dim=0)
 
 
+def compute_anyres_pointer_indices(image_size, grid_pinpoints, tile_side: int, base_per_side: int, coords):
+    """
+    Compute global visual token indices for normalized coordinates under AnyRes tiling.
+
+    - image_size: (W, H) original image size
+    - grid_pinpoints: list or string of candidate anyres resolutions
+    - tile_side: the vision tower's tile size (e.g., 1024)
+    - base_per_side: number of patches per side in a single tile (e.g., 16)
+    - coords: list of (x, y) in [0, 1]
+
+    Returns a sorted unique list of global indices and the total visual length (vlen).
+    Index layout matches llava_arch spatial merge order:
+      [base_per_side^2] + flatten over dims (tile_y, patch_y, tile_x, patch_x)
+    """
+    if type(grid_pinpoints) is list:
+        pinpoints = grid_pinpoints
+    else:
+        pinpoints = ast.literal_eval(grid_pinpoints)
+
+    base_tokens = base_per_side * base_per_side
+    # Derive tile grid for the selected best resolution
+    num_tile_w, num_tile_h = get_anyres_image_grid_shape(image_size, pinpoints, tile_side)
+    vlen = base_tokens + (num_tile_w * num_tile_h * base_tokens)
+
+    out = set()
+    eps = 1e-6
+    for (x, y) in coords:
+        xf = float(x)
+        yf = float(y)
+        assert 0.0 <= xf <= 1.0 and 0.0 <= yf <= 1.0, "coords must be normalized"
+
+        x_rel = xf * num_tile_w
+        y_rel = yf * num_tile_h
+        tile_x = int(min(max(math.floor(x_rel), 0), num_tile_w - 1))
+        tile_y = int(min(max(math.floor(y_rel), 0), num_tile_h - 1))
+        lx = x_rel - tile_x
+        ly = y_rel - tile_y
+        px = int(min(max(math.floor(lx * base_per_side), 0), base_per_side - 1))
+        py = int(min(max(math.floor(ly * base_per_side), 0), base_per_side - 1))
+
+        idx_local = (((tile_y * base_per_side + py) * num_tile_w) + tile_x) * base_per_side + px
+        idx_global = base_tokens + idx_local
+        if 0 <= idx_global < vlen:
+            out.add(idx_global)
+
+        # Boundary neighbors
+        if abs(x_rel - (tile_x + 1)) < eps and tile_x + 1 < num_tile_w:
+            t2x = tile_x + 1
+            p2x = 0
+            idx_local_2 = (((tile_y * base_per_side + py) * num_tile_w) + t2x) * base_per_side + p2x
+            idx_global_2 = base_tokens + idx_local_2
+            if 0 <= idx_global_2 < vlen:
+                out.add(idx_global_2)
+        if abs(x_rel - tile_x) < eps and tile_x - 1 >= 0:
+            t2x = tile_x - 1
+            p2x = base_per_side - 1
+            idx_local_2 = (((tile_y * base_per_side + py) * num_tile_w) + t2x) * base_per_side + p2x
+            idx_global_2 = base_tokens + idx_local_2
+            if 0 <= idx_global_2 < vlen:
+                out.add(idx_global_2)
+        if abs(y_rel - (tile_y + 1)) < eps and tile_y + 1 < num_tile_h:
+            t2y = tile_y + 1
+            p2y = 0
+            idx_local_2 = (((t2y * base_per_side + p2y) * num_tile_w) + tile_x) * base_per_side + px
+            idx_global_2 = base_tokens + idx_local_2
+            if 0 <= idx_global_2 < vlen:
+                out.add(idx_global_2)
+        if abs(y_rel - tile_y) < eps and tile_y - 1 >= 0:
+            t2y = tile_y - 1
+            p2y = base_per_side - 1
+            idx_local_2 = (((t2y * base_per_side + p2y) * num_tile_w) + tile_x) * base_per_side + px
+            idx_global_2 = base_tokens + idx_local_2
+            if 0 <= idx_global_2 < vlen:
+                out.add(idx_global_2)
+
+    return sorted(out), vlen
+
+
 def load_image_from_base64(image):
     return Image.open(BytesIO(base64.b64decode(image)))
 

@@ -7,7 +7,8 @@ NPROC=${NPROC:-2}                       # default for 2x A100 80GB
 MODEL_PATH=${MODEL_PATH:-"checkpoints/llava-fastvithd_7b_stage3"}
 VISION_TOWER=${VISION_TOWER:-"mobileclip_l_1024"}
 # Use GUI-Actor style YAML config listing multiple datasets
-DATA_CONFIG=${DATA_CONFIG:-"/home/sdan/workspace/GUI-Actor/data/data_config.yaml"}
+# Default to a local config that points at /home/sdan/workspace/GUI-Actor/GUI-Actor-Data
+DATA_CONFIG=${DATA_CONFIG:-"scripts/data_config_local.yaml"}
 OUTPUT_DIR=${OUTPUT_DIR:-"out/pointer_warmup"}
 
 TORCH_CMD=(python)
@@ -23,10 +24,11 @@ else
   # Sensible default for mobileclip_l_* families
   TILE_SIZE=1024
 fi
-# Use integer multiples of tile size to ensure whole-tile grids: [(T,T),(2T,T),(2T,2T)]
+# Use integer multiples of tile size to ensure whole-tile grids and handle portrait/landscape:
+# [(T,T), (2T,T), (T,2T), (2T,2T)]
 TP1=$TILE_SIZE
 TP2=$((TILE_SIZE * 2))
-GRID_PINPOINTS="[("$TP1","$TP1"),("$TP2","$TP1"),("$TP2","$TP2")]"
+GRID_PINPOINTS="[("$TP1","$TP1"),("$TP2","$TP1"),("$TP1","$TP2"),("$TP2","$TP2")]"
 
 "${TORCH_CMD[@]}" -m llava.train.train_pointer \
   --deepspeed GUI-Actor/scripts/zero3.json \

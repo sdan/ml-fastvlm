@@ -1,0 +1,20 @@
+datasets:
+  - json_path: /home/sdan/workspace/GUI-Actor/GUI-Actor-Data/uground_bbox.json
+    images_folder: /home/sdan/workspace/GUI-Actor/GUI-Actor-Data/Uground_images
+    sampling_strategy: "all"
+  - json_path: /home/sdan/workspace/GUI-Actor/GUI-Actor-Data/guienv_bbox.json
+    images_folder: /home/sdan/workspace/GUI-Actor/GUI-Actor-Data/GUIEnv_images
+    sampling_strategy: "all"
+  - json_path: /home/sdan/workspace/GUI-Actor/GUI-Actor-Data/guiact_bbox.json
+    images_folder: /home/sdan/workspace/GUI-Actor/GUI-Actor-Data/GUIAct_images
+    sampling_strategy: "all"
+  - json_path: /home/sdan/workspace/GUI-Actor/GUI-Actor-Data/amex_bbox.json
+    images_folder: /home/sdan/workspace/GUI-Actor/GUI-Actor-Data/AMEX_images
+    sampling_strategy: "all"
+  - json_path: /home/sdan/workspace/GUI-Actor/GUI-Actor-Data/androidcontrol_bbox.json
+    images_folder: /home/sdan/workspace/GUI-Actor/GUI-Actor-Data/AndroidControl_images
+    sampling_strategy: "all"
+  - json_path: /home/sdan/workspace/GUI-Actor/GUI-Actor-Data/wave_ui_bbox.json
+    images_folder: /home/sdan/workspace/GUI-Actor/GUI-Actor-Data/Wave-UI_images
+    sampling_strategy: "all"
+

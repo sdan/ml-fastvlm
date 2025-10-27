@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 
 from typing import List, Optional, Tuple, Union
 
@@ -215,20 +216,27 @@ class LlavaQwen2ForCausalLMWithPointer(_BaseLlavaQwen2ForCausalLM):
             grid_N = self._compute_visual_grid_size()
 
             for i in range(bs):
-                # Use input token ids to locate pointer token positions, not labels
-                ids_row = (_input_ids[i] if '_input_ids' in locals() and _input_ids is not None else input_ids[i]) if input_ids is not None else None
-                if ids_row is None or ptr_token_id is None:
-                    raise ValueError("Pointer supervision requested but input_ids or pointer_pad_token_id is missing.")
-                target_positions = torch.nonzero(ids_row == ptr_token_id, as_tuple=False).squeeze(-1)
+                # Locate pointer token positions from the final labels (after image insertion and any truncation/padding)
+                # to ensure indices align with last_hidden's sequence length.
+                if new_labels is None or ptr_token_id is None:
+                    raise ValueError("Pointer supervision requested but new_labels or pointer_pad_token_id is missing.")
+                labels_row = new_labels[i]
+                target_positions = torch.nonzero(labels_row == ptr_token_id, as_tuple=False).squeeze(-1)
                 if target_positions.numel() == 0:
                     raise ValueError(
-                        "Pointer supervision requested but no pointer tokens were found in input_ids. "
-                        "Make sure dataset injected <|pointer_start|><|pointer_pad|><|pointer_end|>."
+                        "Pointer supervision requested but no pointer tokens were found in labels. "
+                        "Ensure the dataset injected <|pointer_start|><|pointer_pad|><|pointer_end|> into assistant text."
                     )
                 real_target_count += int(target_positions.numel())
 
-                # target hidden states (queries)
-                target_hidden = last_hidden[i, target_positions]  # [n_target, hidden]
+                # target hidden states (queries). Guard against any stale/bad indices.
+                seq_len = last_hidden.shape[1]
+                # Keep only in-bounds indices and move to correct device for indexing
+                target_positions = target_positions[target_positions >= 0]
+                target_positions = target_positions[target_positions < seq_len]
+                if target_positions.numel() == 0:
+                    raise ValueError("Pointer supervision: all target positions are out of bounds after truncation.")
+                target_hidden = last_hidden[i, target_positions.to(last_hidden.device)]  # [n_target, hidden]
 
                 # Visual embeddings (keys). Prefer re-encoded image features.
                 # img_feats_list[i] is [N, hidden] or [M, N, hidden] if list-handled upstream
@@ -244,31 +252,131 @@ class LlavaQwen2ForCausalLMWithPointer(_BaseLlavaQwen2ForCausalLM):
                 if multi_patch_labels is not None and multi_patch_labels[i] is not None:
                     labels_multi = multi_patch_labels[i].to(visual_embeds.device)
                 elif coordinates is not None and coordinates[i] is not None:
-                    # Build a one-hot map from (x,y) normalized to [0,1] into a flattened grid.
-                    # Prefer the tower-reported grid size; otherwise infer from visual token count.
+                    # Tile-aware mapping for AnyRes: compute the tile grid (num_patch_width/height)
+                    # and offset by the base downsampled tokens.
+                    # Fallback to single-grid mapping if AnyRes metadata is unavailable.
                     vlen = visual_embeds.shape[0]
-                    infer_grid = grid_N
-                    if infer_grid is None:
-                        # Best-effort square inference if possible
-                        root = int((vlen) ** 0.5)
-                        if root * root == vlen:
-                            infer_grid = root
-                    if infer_grid is None or infer_grid <= 0:
-                        raise ValueError(
-                            "Coordinates provided but grid size is unknown and cannot be inferred from visual token count."
-                        )
+                    base_per_side = grid_N  # e.g., 16 for 1024/patch vision towers
+                    base_tokens = None if base_per_side is None else (base_per_side * base_per_side)
+
+                    num_tile_w = None
+                    num_tile_h = None
+                    tile_side = None
+                    try:
+                        # Mirror logic in llava_arch: derive the tower tile size
+                        vt = self.get_vision_tower()
+                        if hasattr(vt, 's2_image_size'):
+                            tile_side = vt.s2_image_size
+                        elif isinstance(vt.config, dict):
+                            tile_side = vt.config.get("image_cfg", {}).get("image_size", None)
+                        else:
+                            tile_side = getattr(vt.config, 'image_size', None)
+
+                        # image_sizes[i] is [W, H] per PointerCollator
+                        if image_sizes is not None and tile_side is not None and hasattr(self.config, 'image_grid_pinpoints') and self.config.image_grid_pinpoints is not None:
+                            from llava.mm_utils import get_anyres_image_grid_shape
+                            iw, ih = image_sizes[i]
+                            num_tile_w, num_tile_h = get_anyres_image_grid_shape((iw, ih), self.config.image_grid_pinpoints, tile_side)
+                    except Exception:
+                        # Fall back to flat mapping below if anything goes wrong
+                        num_tile_w, num_tile_h = None, None
+
                     # Validate normalized coordinates
                     for (x, y) in coordinates[i]:
                         if not (0.0 <= float(x) <= 1.0 and 0.0 <= float(y) <= 1.0):
                             raise ValueError(f"Coordinates must be normalized to [0,1], got ({x}, {y}).")
-                    tgt_cnt = len(coordinates[i])
+
+                    # Use the actual number of target tokens as rows; coordinates may contain extra noise
+                    tgt_cnt = int(target_hidden.shape[0])
                     labels_multi = torch.zeros((tgt_cnt, vlen), device=visual_embeds.device, dtype=torch.float32)
-                    for r, (x, y) in enumerate(coordinates[i]):
-                        x_idx = min(max(int(float(x) * infer_grid), 0), infer_grid - 1)
-                        y_idx = min(max(int(float(y) * infer_grid), 0), infer_grid - 1)
-                        idx = y_idx * infer_grid + x_idx
-                        if 0 <= idx < vlen:
-                            labels_multi[r, idx] = 1.0
+                    coords_list = coordinates[i]
+                    if len(coords_list) != tgt_cnt:
+                        # Keep it quiet but robust: align to the min length
+                        use_n = min(len(coords_list), tgt_cnt)
+                        if use_n == 0:
+                            raise ValueError("Pointer supervision: zero effective targets after aligning coordinates to tokens.")
+                        coords_iter = list(coords_list)[:use_n]
+                    else:
+                        coords_iter = coords_list
+
+                    if num_tile_w is not None and num_tile_h is not None and base_tokens is not None:
+                        # Expect vlen = base_tokens + num_tile_w*num_tile_h*base_tokens in 'spatial' path.
+                        # Proceed best-effort even if it differs (e.g., due to different merge type).
+                        eps = 1e-6
+                        for r, (x, y) in enumerate(coords_iter):
+                            xf = float(x)
+                            yf = float(y)
+                            # Continuous tile coordinates
+                            x_rel = xf * num_tile_w
+                            y_rel = yf * num_tile_h
+                            tile_x = int(min(max(math.floor(x_rel), 0), num_tile_w - 1))
+                            tile_y = int(min(max(math.floor(y_rel), 0), num_tile_h - 1))
+                            # Local fractional position within tile
+                            lx = x_rel - tile_x
+                            ly = y_rel - tile_y
+                            # Map to patch indices within the tile grid (base_per_side x base_per_side)
+                            px = int(min(max(math.floor(lx * base_per_side), 0), base_per_side - 1))
+                            py = int(min(max(math.floor(ly * base_per_side), 0), base_per_side - 1))
+
+                            # Compute global index within the concatenated visual embeddings
+                            # Layout in llava_arch (spatial): [base 256] + flatten over dims (tile_y, patch_y, tile_x, patch_x)
+                            idx_local = (((tile_y * base_per_side + py) * num_tile_w) + tile_x) * base_per_side + px
+                            idx_global = base_tokens + idx_local
+                            if 0 <= idx_global < vlen:
+                                labels_multi[r, idx_global] = 1.0
+
+                            # Boundary handling: if the click lies exactly on a tile boundary, also mark the adjacent tile's edge patch
+                            # Left/right boundaries
+                            # Right neighbor (close to next tile boundary)
+                            if abs((xf * num_tile_w) - (tile_x + 1)) < eps and tile_x + 1 < num_tile_w:
+                                # Right tile, leftmost column
+                                t2x = tile_x + 1
+                                p2x = 0
+                                idx_local_2 = (((tile_y * base_per_side + py) * num_tile_w) + t2x) * base_per_side + p2x
+                                idx_global_2 = base_tokens + idx_local_2
+                                if 0 <= idx_global_2 < vlen:
+                                    labels_multi[r, idx_global_2] = 1.0
+                            # Left neighbor (close to previous tile boundary)
+                            if abs((xf * num_tile_w) - tile_x) < eps and tile_x - 1 >= 0:
+                                t2x = tile_x - 1
+                                p2x = base_per_side - 1
+                                idx_local_2 = (((tile_y * base_per_side + py) * num_tile_w) + t2x) * base_per_side + p2x
+                                idx_global_2 = base_tokens + idx_local_2
+                                if 0 <= idx_global_2 < vlen:
+                                    labels_multi[r, idx_global_2] = 1.0
+                            # Top/bottom boundaries
+                            if abs((yf * num_tile_h) - (tile_y + 1)) < eps and tile_y + 1 < num_tile_h:
+                                t2y = tile_y + 1
+                                p2y = 0
+                                idx_local_2 = (((t2y * base_per_side + p2y) * num_tile_w) + tile_x) * base_per_side + px
+                                idx_global_2 = base_tokens + idx_local_2
+                                if 0 <= idx_global_2 < vlen:
+                                    labels_multi[r, idx_global_2] = 1.0
+                            if abs((yf * num_tile_h) - tile_y) < eps and tile_y - 1 >= 0:
+                                t2y = tile_y - 1
+                                p2y = base_per_side - 1
+                                idx_local_2 = (((t2y * base_per_side + p2y) * num_tile_w) + tile_x) * base_per_side + px
+                                idx_global_2 = base_tokens + idx_local_2
+                                if 0 <= idx_global_2 < vlen:
+                                    labels_multi[r, idx_global_2] = 1.0
+                    else:
+                        # Fallback: original single-grid mapping over the entire visual token sequence
+                        infer_grid = base_per_side
+                        if infer_grid is None:
+                            # Best-effort square inference
+                            root = int((vlen) ** 0.5)
+                            if root * root == vlen:
+                                infer_grid = root
+                        if infer_grid is None or infer_grid <= 0:
+                            raise ValueError(
+                                "Coordinates provided but grid size is unknown and cannot be inferred from visual token count."
+                            )
+                        for r, (x, y) in enumerate(coords_iter):
+                            x_idx = min(max(int(float(x) * infer_grid), 0), infer_grid - 1)
+                            y_idx = min(max(int(float(y) * infer_grid), 0), infer_grid - 1)
+                            idx = y_idx * infer_grid + x_idx
+                            if 0 <= idx < vlen:
+                                labels_multi[r, idx] = 1.0
                 elif bboxes is not None and bboxes[i] is not None and grid_N is not None:
                     # Build binary mask over the grid for a bbox, replicate per target
                     vlen = visual_embeds.shape[0]
@@ -289,6 +397,26 @@ class LlavaQwen2ForCausalLMWithPointer(_BaseLlavaQwen2ForCausalLM):
                     raise ValueError(
                         "Pointer supervision requested but neither multi_patch_labels, coordinates, nor bboxes are provided for a sample."
                     )
+
+                # Ensure label tensor shape matches [n_target, n_enc]
+                if labels_multi is not None:
+                    n_dec = int(target_hidden.shape[0])
+                    n_enc = int(visual_embeds.shape[0])
+                    # Align rows (targets)
+                    if labels_multi.shape[0] != n_dec:
+                        new_rows = min(n_dec, labels_multi.shape[0])
+                        target_hidden = target_hidden[:new_rows]
+                        labels_multi = labels_multi[:new_rows, :]
+                        n_dec = new_rows
+                    # Align cols (visual tokens)
+                    if labels_multi.shape[1] != n_enc:
+                        if labels_multi.shape[1] < n_enc:
+                            pad_cols = n_enc - labels_multi.shape[1]
+                            labels_multi = torch.cat(
+                                [labels_multi, labels_multi.new_zeros((labels_multi.shape[0], pad_cols))], dim=1
+                            )
+                        else:
+                            labels_multi = labels_multi[:, :n_enc]
 
                 # Compute pointer loss for this sample
                 attn_scores, loss_v = self.multi_patch_pointer_head(
