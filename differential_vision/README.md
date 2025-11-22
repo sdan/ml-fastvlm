@@ -107,15 +107,7 @@ The cache maintains:
 
 ## Benchmark Results
 
-On typical computer-use scenarios:
-
-| Scenario | Changed Patches | Speedup |
-|----------|----------------|---------|
-| Cursor movement | 2-4 patches (0.1%) | 250x |
-| Button click | 4-8 patches (0.2%) | 125x |
-| Text input | 10-20 patches (0.5%) | 50x |
-| Dialog open | 100-200 patches (5%) | 10x |
-| Page scroll | Full re-encode | 1x |
+None
 
 Overall average: **3-10x speedup** depending on interaction patterns.
 
@@ -176,14 +168,4 @@ python differential_vision/benchmark.py --screenshot-dir ./screenshots/
 
 # Compare with baseline (original LLaVA)
 python differential_vision/compare_baseline.py
-```
-
-## Citation
-
-If you use this differential vision encoding approach, please cite:
-
-```
-Differential Vision Tokens for Fast Computer-Use Models
-[Your name/organization]
-2024
 ```
